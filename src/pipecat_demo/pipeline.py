@@ -27,8 +27,8 @@ from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
-from paytm_demo.config import CascadeConfig
-from paytm_demo.latency import CascadeLatencyMonitor, LatencyStore
+from pipecat_demo.config import CascadeConfig
+from pipecat_demo.latency import CascadeLatencyMonitor, LatencyStore
 
 GREETING_PROMPT = (
     "Greet the user warmly in one short sentence and invite them to ask any general question."

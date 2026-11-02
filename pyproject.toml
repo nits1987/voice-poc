@@ -1,5 +1,5 @@
 [project]
-name = "paytm-demo"
+name = "pipecat-demo"
 version = "0.1.0"
 description = "Pipecat STT -> LLM -> TTS cascade voice bot with per-block and end-to-end latency profiling (Gemini Live Transcribe + Gemini 3.5 Flash-Lite + Gemini 3.8 Flash-Lite TTS)"
 readme = "README.md"
@@ -15,8 +15,8 @@ dependencies = [
 ]
 
 [project.scripts]
-paytm-demo = "paytm_demo.server:run"
-paytm-benchmark = "paytm_demo.benchmark:run"
+pipecat-demo = "pipecat_demo.server:run"
+pipecat-benchmark = "pipecat_demo.benchmark:run"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

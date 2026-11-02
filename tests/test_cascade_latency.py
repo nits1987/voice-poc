@@ -39,16 +39,16 @@ from pipecat.metrics.metrics import (
 from pipecat.observers.base_observer import FramePushed
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-from paytm_demo.benchmark import pcm16le_to_wav_bytes, strip_wav_header_if_present
-from paytm_demo.config import CascadeConfig
-from paytm_demo.latency import CascadeLatencyMonitor, LatencyStore, format_turn_report
-from paytm_demo.pipeline import (
+from pipecat_demo.benchmark import pcm16le_to_wav_bytes, strip_wav_header_if_present
+from pipecat_demo.config import CascadeConfig
+from pipecat_demo.latency import CascadeLatencyMonitor, LatencyStore, format_turn_report
+from pipecat_demo.pipeline import (
     build_transport_params,
     build_user_aggregator_params,
     build_websocket_params,
     create_cascade_services,
 )
-from paytm_demo.server import register_observatory_routes
+from pipecat_demo.server import register_observatory_routes
 
 
 class _FakeClock:
@@ -551,7 +551,7 @@ class CascadeLatencyTest(unittest.IsolatedAsyncioTestCase):
                 "id": "ready-01",
                 "data": {
                     "version": "2.2.0",
-                    "about": {"library": "paytm-cascade-observatory-ws"},
+                    "about": {"library": "pipecat-cascade-observatory-ws"},
                 },
             }
         ).encode("utf-8")

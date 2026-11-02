@@ -19,10 +19,10 @@ from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pydantic import BaseModel, Field
 
-from paytm_demo.benchmark import run_simulated_voice_turn
-from paytm_demo.config import TurnStopMode, load_config
-from paytm_demo.latency import LatencyStore
-from paytm_demo.pipeline import (
+from pipecat_demo.benchmark import run_simulated_voice_turn
+from pipecat_demo.config import TurnStopMode, load_config
+from pipecat_demo.latency import LatencyStore
+from pipecat_demo.pipeline import (
     build_transport_params,
     build_websocket_params,
     create_cascade_session,
@@ -187,9 +187,9 @@ register_observatory_routes(app, GLOBAL_LATENCY_STORE)
 
 
 def run() -> None:
-    """Start the FastAPI + Pipecat Runner server (`paytm-demo` / `python bot.py`)."""
+    """Start the FastAPI + Pipecat Runner server (`pipecat-demo` / `python bot.py`)."""
     # Ensure pipecat.runner.run._get_bot_module() always resolves this module's `bot`
-    # even when invoked via the console script entrypoint `uv run paytm-demo`.
+    # even when invoked via the console script entrypoint `uv run pipecat-demo`.
     current_module = sys.modules[__name__]
     sys.modules.setdefault("bot", current_module)
     main_mod = sys.modules.get("__main__")

@@ -28,14 +28,14 @@ from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 
-from paytm_demo.config import CascadeConfig, TurnStopMode, load_config
-from paytm_demo.latency import (
+from pipecat_demo.config import CascadeConfig, TurnStopMode, load_config
+from pipecat_demo.latency import (
     LatencyStore,
     LatencySummary,
     TurnLatencyRecord,
     format_turn_report,
 )
-from paytm_demo.pipeline import (
+from pipecat_demo.pipeline import (
     build_transport_params,
     create_cascade_session,
     run_cascade_worker,
@@ -442,7 +442,7 @@ async def _async_main(args: argparse.Namespace) -> int:
 
 
 def run() -> None:
-    """CLI entrypoint for `paytm-benchmark` and `benchmark_cascade.py`."""
+    """CLI entrypoint for `pipecat-benchmark` and `benchmark_cascade.py`."""
     parser = argparse.ArgumentParser(
         description=(
             "Measure real end-to-end and per-block latency across Gemini Live Transcribe -> "
