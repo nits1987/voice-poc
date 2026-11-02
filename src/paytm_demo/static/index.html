@@ -1,0 +1,1425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gemini Cascade Voice Bot · Pipecat Latency Observatory</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg-canvas: #090d16;
+      --bg-surface: #111827;
+      --bg-elevated: #172033;
+      --bg-subtle: #1e293b;
+      --border: rgba(148, 163, 184, 0.16);
+      --border-strong: rgba(148, 163, 184, 0.28);
+      --text-primary: #f8fafc;
+      --text-secondary: #cbd5e1;
+      --text-muted: #94a3b8;
+
+      /* Stage palette */
+      --c-vad: #64748b;
+      --c-stt: #06b6d4;
+      --c-turn: #a855f7;
+      --c-llm: #f59e0b;
+      --c-agg: #ec4899;
+      --c-tts: #10b981;
+      --c-out: #3b82f6;
+      --c-pipe: #475569;
+
+      --accent: #38bdf8;
+      --success: #22c55e;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --radius-lg: 14px;
+      --radius-md: 10px;
+      --radius-sm: 7px;
+      --font-sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-block-size: 100dvb;
+      background:
+        radial-gradient(circle at 12% 0%, rgba(6, 182, 212, 0.11), transparent 36%),
+        radial-gradient(circle at 88% 4%, rgba(16, 185, 129, 0.09), transparent 36%),
+        var(--bg-canvas);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      line-height: 1.45;
+    }
+
+    .app-shell {
+      max-inline-size: 1440px;
+      margin-inline: auto;
+      padding-block: 1.25rem 2.5rem;
+      padding-inline: clamp(1rem, 2.4vw, 2rem);
+      display: grid;
+      grid-template-columns: minmax(340px, 410px) minmax(0, 1fr);
+      grid-template-areas:
+        "topbar topbar"
+        "arch   arch"
+        "kpis   kpis"
+        "left   right";
+      gap: 1.1rem;
+    }
+
+    @media (max-width: 1040px) {
+      .app-shell {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas:
+          "topbar"
+          "arch"
+          "kpis"
+          "left"
+          "right";
+      }
+    }
+
+    /* Top Header */
+    .topbar {
+      grid-area: topbar;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding-block: 0.95rem;
+      padding-inline: 1.2rem;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+    }
+
+    .brand-group {
+      display: flex;
+      align-items: center;
+      gap: 0.85rem;
+    }
+
+    .brand-mark {
+      inline-size: 2.5rem;
+      block-size: 2.5rem;
+      border-radius: 10px;
+      background: linear-gradient(135deg, rgba(6, 182, 212, 0.25), rgba(16, 185, 129, 0.25));
+      border: 1px solid rgba(56, 189, 248, 0.4);
+      display: grid;
+      place-content: center;
+      font-family: var(--font-mono);
+      font-weight: 700;
+      color: var(--accent);
+      font-size: 0.95rem;
+    }
+
+    .brand-title {
+      margin: 0;
+      font-size: 1.12rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+
+    .brand-subtitle {
+      margin: 0.15rem 0 0;
+      font-size: 0.82rem;
+      color: var(--text-muted);
+    }
+
+    .topbar-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.6rem;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      padding-block: 0.35rem;
+      padding-inline: 0.75rem;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+    }
+
+    .status-dot {
+      inline-size: 0.55rem;
+      block-size: 0.55rem;
+      border-radius: 50%;
+      background: var(--text-muted);
+    }
+    .status-dot.connected { background: var(--success); box-shadow: 0 0 8px var(--success); }
+    .status-dot.speaking  { background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+    .status-dot.warn      { background: var(--warning); }
+
+    /* Banner alert for missing API key or non-HTTPS mic notice */
+    .alert-banner {
+      margin-block-start: 0.7rem;
+      padding-block: 0.65rem;
+      padding-inline: 0.9rem;
+      border-radius: var(--radius-md);
+      font-size: 0.81rem;
+      background: rgba(245, 158, 11, 0.11);
+      border: 1px solid rgba(245, 158, 11, 0.35);
+      color: #fde68a;
+    }
+    .alert-banner[hidden] {
+      display: none;
+    }
+    .alert-banner code {
+      font-family: var(--font-mono);
+      background: rgba(15, 23, 42, 0.65);
+      padding-inline: 0.35rem;
+      padding-block: 0.1rem;
+      border-radius: 4px;
+    }
+
+    /* Architecture Strip */
+    .arch-strip {
+      grid-area: arch;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding-block: 0.85rem;
+      padding-inline: 1.15rem;
+    }
+
+    .arch-nodes {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .arch-node {
+      flex: 1 1 170px;
+      min-inline-size: 0;
+      padding-block: 0.55rem;
+      padding-inline: 0.75rem;
+      border-radius: var(--radius-md);
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-inline-start: 3px solid var(--node-color, var(--accent));
+      transition: border-color 140ms ease, transform 140ms ease;
+    }
+    .arch-node.active {
+      border-color: var(--node-color, var(--accent));
+      transform: translateY(-1px);
+    }
+
+    .arch-node-stage {
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    .arch-node-model {
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--text-primary);
+      white-space: nowrap;
+      overflow: clip;
+      text-overflow: ellipsis;
+      margin-block-start: 0.15rem;
+    }
+
+    .arch-arrow {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      user-select: none;
+    }
+
+    /* KPI Summary Cards aligned with CSS Subgrid */
+    .kpi-grid {
+      grid-area: kpis;
+      display: grid;
+      inline-size: 100%;
+      grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
+      grid-template-rows: auto 1fr auto;
+      gap: 0.9rem;
+    }
+
+    .kpi-card {
+      grid-row: span 3;
+      display: grid;
+      /* Same-cascade fallback before subgrid */
+      grid-template-rows: auto 1fr auto;
+      grid-template-rows: subgrid;
+      row-gap: 0.4rem;
+      padding-block: 0.95rem;
+      padding-inline: 1.05rem;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+    }
+
+    .kpi-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+      font-size: 0.76rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+    }
+
+    .kpi-swatch {
+      inline-size: 0.6rem;
+      block-size: 0.6rem;
+      border-radius: 2px;
+      background: var(--swatch, var(--accent));
+    }
+
+    .kpi-value {
+      font-family: var(--font-mono);
+      font-size: 1.7rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text-primary);
+      align-self: center;
+    }
+
+    .kpi-meta {
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+      color: var(--text-muted);
+      border-block-start: 1px solid var(--border);
+      padding-block-start: 0.45rem;
+    }
+
+    /* Left & Right Workspace Columns */
+    .left-col {
+      grid-area: left;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .right-col {
+      grid-area: right;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      min-inline-size: 0;
+    }
+
+    .panel {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding-block: 1rem;
+      padding-inline: 1.15rem;
+    }
+
+    /* Containment for high-frequency streaming regions */
+    .stream-region {
+      content-visibility: auto;
+      contain-intrinsic-size: auto 360px auto 520px;
+    }
+
+    @supports not (content-visibility: auto) {
+      .stream-region {
+        contain: layout style paint;
+      }
+    }
+
+    .panel-header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.6rem;
+      margin-block-end: 0.85rem;
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 0.95rem;
+      font-weight: 700;
+    }
+
+    .panel-subtitle {
+      margin: 0.15rem 0 0;
+      font-size: 0.78rem;
+      color: var(--text-muted);
+    }
+
+    /* Buttons & Inputs */
+    button, .btn-link {
+      appearance: none;
+      font-family: var(--font-sans);
+      font-size: 0.82rem;
+      font-weight: 600;
+      border-radius: var(--radius-sm);
+      padding-block: 0.5rem;
+      padding-inline: 0.85rem;
+      border: 1px solid var(--border-strong);
+      background: var(--bg-elevated);
+      color: var(--text-primary);
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.4rem;
+      transition: background 120ms ease, border-color 120ms ease, opacity 120ms ease;
+    }
+
+    button:hover:not(:disabled), .btn-link:hover {
+      background: var(--bg-subtle);
+      border-color: rgba(148, 163, 184, 0.45);
+    }
+
+    button:disabled {
+      opacity: 0.48;
+      cursor: not-allowed;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #0284c7, #0ea5e9);
+      border-color: #38bdf8;
+      color: #ffffff;
+    }
+    .btn-primary:hover:not(:disabled) {
+      background: linear-gradient(135deg, #0369a1, #0284c7);
+    }
+
+    .btn-danger {
+      background: rgba(239, 68, 68, 0.16);
+      border-color: rgba(239, 68, 68, 0.45);
+      color: #fca5a5;
+    }
+
+    .control-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.55rem;
+    }
+
+    .sim-form {
+      display: flex;
+      gap: 0.5rem;
+      margin-block-top: 0.5rem;
+    }
+
+    .sim-input {
+      flex: 1 1 auto;
+      min-inline-size: 0;
+      padding-block: 0.5rem;
+      padding-inline: 0.75rem;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-strong);
+      background: var(--bg-canvas);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      font-size: 0.84rem;
+    }
+
+    .chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin-block-start: 0.65rem;
+    }
+
+    .chip {
+      font-size: 0.74rem;
+      font-weight: 500;
+      padding-block: 0.28rem;
+      padding-inline: 0.6rem;
+      border-radius: 999px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+    }
+
+    .audio-preview-wrap {
+      margin-block-start: 0.75rem;
+    }
+    .audio-preview-wrap[hidden] {
+      display: none;
+    }
+    .audio-preview-wrap audio {
+      display: block;
+      inline-size: 100%;
+      block-size: 34px;
+    }
+
+    /* Live Transcript Scroll Box */
+    .transcript-list {
+      max-block-size: 380px;
+      min-block-size: 200px;
+      overflow-y: auto;
+      scrollbar-gutter: stable;
+      overscroll-behavior: contain;
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+      padding-inline-end: 0.25rem;
+    }
+
+    .msg-bubble {
+      padding-block: 0.55rem;
+      padding-inline: 0.75rem;
+      border-radius: var(--radius-md);
+      font-size: 0.84rem;
+      border: 1px solid var(--border);
+    }
+    .msg-bubble.user {
+      align-self: flex-end;
+      max-inline-size: 90%;
+      background: rgba(6, 182, 212, 0.13);
+      border-color: rgba(6, 182, 212, 0.34);
+    }
+    .msg-bubble.assistant {
+      align-self: flex-start;
+      max-inline-size: 92%;
+      background: var(--bg-elevated);
+    }
+    .msg-bubble.interim {
+      opacity: 0.72;
+      border-style: dashed;
+    }
+    .msg-role {
+      font-size: 0.68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-block-end: 0.2rem;
+    }
+
+    /* Waterfall Legend */
+    .legend-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.65rem 1rem;
+      padding-block: 0.55rem;
+      padding-inline: 0.75rem;
+      background: var(--bg-elevated);
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border);
+      margin-block-end: 0.9rem;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.38rem;
+    }
+
+    .legend-dot {
+      inline-size: 0.62rem;
+      block-size: 0.62rem;
+      border-radius: 2px;
+    }
+
+    /* Turn Waterfall Cards */
+    .turns-scroll {
+      max-block-size: 680px;
+      overflow-y: auto;
+      scrollbar-gutter: stable;
+      overscroll-behavior: contain;
+      display: flex;
+      flex-direction: column;
+      gap: 0.85rem;
+      padding-inline-end: 0.25rem;
+    }
+
+    .turn-card {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding-block: 0.85rem;
+      padding-inline: 1rem;
+      content-visibility: auto;
+      contain-intrinsic-size: auto 600px auto 230px;
+    }
+
+    .turn-top {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+      margin-block-end: 0.55rem;
+    }
+
+    .turn-badge {
+      font-family: var(--font-mono);
+      font-size: 0.73rem;
+      font-weight: 700;
+      padding-block: 0.18rem;
+      padding-inline: 0.5rem;
+      border-radius: 5px;
+      background: rgba(56, 189, 248, 0.15);
+      color: var(--accent);
+    }
+    .turn-badge.greeting {
+      background: rgba(148, 163, 184, 0.16);
+      color: var(--text-muted);
+    }
+
+    .turn-e2e {
+      font-family: var(--font-mono);
+      font-size: 0.88rem;
+      font-weight: 700;
+    }
+
+    .turn-utterances {
+      font-size: 0.81rem;
+      color: var(--text-secondary);
+      margin-block-end: 0.7rem;
+      display: grid;
+      gap: 0.22rem;
+    }
+    .turn-utterances strong {
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    /* Timeline Track */
+    .waterfall-track {
+      position: relative;
+      block-size: 1.55rem;
+      inline-size: 100%;
+      background: rgba(9, 13, 22, 0.75);
+      border-radius: 6px;
+      overflow: clip;
+      border: 1px solid var(--border);
+      margin-block-end: 0.65rem;
+    }
+
+    .wf-segment {
+      position: absolute;
+      inset-block: 0;
+      min-inline-size: 2px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--font-mono);
+      font-size: 0.67rem;
+      font-weight: 700;
+      color: #090d16;
+      overflow: clip;
+      white-space: nowrap;
+    }
+
+    /* Detailed Stage & Service Breakdown Grid */
+    .stage-metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+      gap: 0.45rem;
+    }
+
+    .stage-cell {
+      padding-block: 0.42rem;
+      padding-inline: 0.6rem;
+      border-radius: 6px;
+      background: rgba(15, 23, 42, 0.65);
+      border: 1px solid var(--border);
+      font-size: 0.74rem;
+    }
+
+    .stage-cell-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--text-muted);
+      margin-block-end: 0.15rem;
+    }
+
+    .stage-cell-val {
+      font-family: var(--font-mono);
+      font-weight: 700;
+      color: var(--text-primary);
+      font-size: 0.82rem;
+    }
+
+    .empty-state {
+      padding-block: 2.2rem;
+      padding-inline: 1rem;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      border: 1px dashed var(--border-strong);
+      border-radius: var(--radius-md);
+    }
+  </style>
+</head>
+<body>
+  <main class="app-shell">
+    <!-- Header -->
+    <header class="topbar">
+      <div class="brand-group">
+        <div class="brand-mark">PC</div>
+        <div>
+          <h1 class="brand-title">Pipecat Gemini Cascade · Latency Observatory</h1>
+          <p class="brand-subtitle">
+            Real-time STT &rarr; LLM &rarr; TTS voice bot with critical-path &amp; per-service latency telemetry
+          </p>
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <div class="status-pill" id="conn-pill">
+          <span class="status-dot" id="conn-dot"></span>
+          <span id="conn-label">Disconnected</span>
+        </div>
+        <a class="btn-link" href="/client/" target="_blank" rel="noopener">Pipecat Prebuilt UI &nearr;</a>
+        <button type="button" id="btn-export">Export JSON</button>
+        <button type="button" id="btn-reset">Reset Stats</button>
+      </div>
+    </header>
+
+    <!-- Architecture Strip -->
+    <section class="arch-strip" aria-label="Cascade pipeline stages">
+      <div class="arch-nodes">
+        <div class="arch-node" id="node-vad" style="--node-color: var(--c-vad)">
+          <div class="arch-node-stage">0 · Local VAD</div>
+          <div class="arch-node-model" id="model-vad">Silero VAD (0.20s)</div>
+        </div>
+        <span class="arch-arrow">&rarr;</span>
+        <div class="arch-node" id="node-stt" style="--node-color: var(--c-stt)">
+          <div class="arch-node-stage">1 · Live STT (WS)</div>
+          <div class="arch-node-model" id="model-stt">gemini-3.5-transcribe-live</div>
+        </div>
+        <span class="arch-arrow">&rarr;</span>
+        <div class="arch-node" id="node-turn" style="--node-color: var(--c-turn)">
+          <div class="arch-node-stage">2 · Endpointing</div>
+          <div class="arch-node-model" id="model-turn">SmartTurn v3 ONNX</div>
+        </div>
+        <span class="arch-arrow">&rarr;</span>
+        <div class="arch-node" id="node-llm" style="--node-color: var(--c-llm)">
+          <div class="arch-node-stage">3 · Streaming LLM</div>
+          <div class="arch-node-model" id="model-llm">gemini-3.5-flash-lite</div>
+        </div>
+        <span class="arch-arrow">&rarr;</span>
+        <div class="arch-node" id="node-tts" style="--node-color: var(--c-tts)">
+          <div class="arch-node-stage">4 · Streaming TTS</div>
+          <div class="arch-node-model" id="model-tts">gemini-3.8-flash-lite-tts</div>
+        </div>
+      </div>
+
+      <div class="alert-banner" id="api-key-banner" hidden></div>
+      <div class="alert-banner" id="mic-context-banner" hidden></div>
+    </section>
+
+    <!-- KPI Summary Cards -->
+    <section class="kpi-grid" aria-label="Aggregate P50 and mean latency metrics">
+      <article class="kpi-card">
+        <div class="kpi-label">
+          <span>Overall E2E (P50)</span>
+          <span class="kpi-swatch" style="--swatch: var(--accent)"></span>
+        </div>
+        <div class="kpi-value" id="kpi-e2e-p50">&mdash;</div>
+        <div class="kpi-meta" id="kpi-e2e-meta">n=0 user turns · Net ex-VAD: &mdash;</div>
+      </article>
+
+      <article class="kpi-card">
+        <div class="kpi-label">
+          <span>1 · Live STT Finalize</span>
+          <span class="kpi-swatch" style="--swatch: var(--c-stt)"></span>
+        </div>
+        <div class="kpi-value" id="kpi-stt-p50">&mdash;</div>
+        <div class="kpi-meta" id="kpi-stt-meta">STT TTFB P50: &mdash; · P95: &mdash;</div>
+      </article>
+
+      <article class="kpi-card">
+        <div class="kpi-label">
+          <span>2 · LLM TTFB (P50)</span>
+          <span class="kpi-swatch" style="--swatch: var(--c-llm)"></span>
+        </div>
+        <div class="kpi-value" id="kpi-llm-p50">&mdash;</div>
+        <div class="kpi-meta" id="kpi-llm-meta">TTFAT P50: &mdash; · Stream: &mdash;</div>
+      </article>
+
+      <article class="kpi-card">
+        <div class="kpi-label">
+          <span>3 · TTS TTFB (P50)</span>
+          <span class="kpi-swatch" style="--swatch: var(--c-tts)"></span>
+        </div>
+        <div class="kpi-value" id="kpi-tts-p50">&mdash;</div>
+        <div class="kpi-meta" id="kpi-tts-meta">TTFA P50: &mdash; · Sent Agg: &mdash;</div>
+      </article>
+
+      <article class="kpi-card">
+        <div class="kpi-label">
+          <span>VAD + Turn + Out</span>
+          <span class="kpi-swatch" style="--swatch: var(--c-turn)"></span>
+        </div>
+        <div class="kpi-value" id="kpi-turn-p50">&mdash;</div>
+        <div class="kpi-meta" id="kpi-turn-meta">VAD: &mdash; · Turn: &mdash; · Out: &mdash;</div>
+      </article>
+    </section>
+
+    <!-- Left Column: Voice Session + Simulator + Transcript -->
+    <div class="left-col">
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Live WebRTC Voice Session</h2>
+            <p class="panel-subtitle">Pipecat RTVI JS Client (&mu;s-synced SmallWebRTC audio)</p>
+          </div>
+        </div>
+        <div class="control-row">
+          <button type="button" class="btn-primary" id="btn-connect">Connect &amp; Talk</button>
+          <button type="button" id="btn-mute" disabled>Mute Mic</button>
+          <button type="button" class="btn-danger" id="btn-disconnect" disabled>Disconnect</button>
+        </div>
+        <audio id="bot-audio" autoplay playsinline hidden></audio>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Spoken Turn Simulator (No Mic Needed)</h2>
+            <p class="panel-subtitle">
+              Synthesizes real 16kHz speech &amp; streams 20ms frames through VAD &rarr; STT &rarr; LLM &rarr; TTS
+            </p>
+          </div>
+        </div>
+        <form class="sim-form" id="sim-form">
+          <input
+            type="text"
+            class="sim-input"
+            id="sim-input"
+            value="Why does ice float on liquid water instead of sinking?"
+            placeholder="Ask any general knowledge question..."
+            required
+          />
+          <button type="submit" class="btn-primary" id="btn-sim">Run Turn</button>
+        </form>
+        <div class="chip-row">
+          <button type="button" class="chip" data-q="Why does ice float on liquid water instead of sinking?">Ice floating</button>
+          <button type="button" class="chip" data-q="How do noise cancelling headphones block background sound?">ANC headphones</button>
+          <button type="button" class="chip" data-q="What causes the northern lights in Earth's polar skies?">Northern lights</button>
+          <button type="button" class="chip" data-q="Why is the sky blue during the day and red at sunset?">Blue sky &amp; sunset</button>
+        </div>
+        <div class="audio-preview-wrap" id="sim-audio-wrap" hidden>
+          <div style="font-size: 0.74rem; color: var(--text-muted); margin-block: 0.5rem 0.25rem;">
+            Latest simulated bot response (24kHz Gemini 3.8 Flash-Lite TTS):
+          </div>
+          <audio id="sim-audio" controls></audio>
+        </div>
+      </section>
+
+      <section class="panel stream-region">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Live Conversation Transcript</h2>
+            <p class="panel-subtitle">Streaming STT interim + finalized turns</p>
+          </div>
+        </div>
+        <div class="transcript-list" id="transcript-list">
+          <div class="empty-state" id="transcript-empty">
+            Connect your microphone or click <strong>Run Turn</strong> above to start measuring voice turns.
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Right Column: Per-Turn Latency Waterfalls -->
+    <div class="right-col">
+      <section class="panel stream-region">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Per-Turn Critical-Path Waterfall &amp; Block Breakdown</h2>
+            <p class="panel-subtitle">
+              Decomposes <code>UserBotLatencyObserver</code> silence-to-speech timeline alongside per-service TTFB / TTFA / Total stream times
+            </p>
+          </div>
+        </div>
+
+        <div class="legend-bar">
+          <span class="legend-item"><span class="legend-dot" style="background: var(--c-vad)"></span>VAD Wait</span>
+          <span class="legend-item"><span class="legend-dot" style="background: var(--c-stt)"></span>STT Finalize</span>
+          <span class="legend-item"><span class="legend-dot" style="background: var(--c-turn)"></span>Turn Detect</span>
+          <span class="legend-item"><span class="legend-dot" style="background: var(--c-llm)"></span>LLM Inference</span>
+          <span class="legend-item"><span class="legend-dot" style="background: var(--c-agg)"></span>Sentence Agg</span>
+          <span class="legend-item"><span class="legend-dot" style="background: var(--c-tts)"></span>TTS Synthesis</span>
+          <span class="legend-item"><span class="legend-dot" style="background: var(--c-out)"></span>Output Transport</span>
+          <span class="legend-item"><span class="legend-dot" style="background: var(--c-pipe)"></span>Pipeline Overhead</span>
+        </div>
+
+        <div class="turns-scroll" id="turns-list">
+          <div class="empty-state">
+            No turns recorded yet. Every spoken question will render a proportional critical-path waterfall and per-block latency breakdown here.
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script type="module">
+    const STAGE_COLORS = {
+      endpointing_wait: "var(--c-vad)",
+      transcription: "var(--c-stt)",
+      turn_detection: "var(--c-turn)",
+      llm_inference: "var(--c-llm)",
+      sentence_aggregation: "var(--c-agg)",
+      speech_synthesis: "var(--c-tts)",
+      output_transport: "var(--c-out)",
+      pipeline: "var(--c-pipe)",
+    };
+
+    const state = {
+      turnsById: new Map(),
+      summary: null,
+      config: null,
+      pcClient: null,
+      micEnabled: true,
+      interimBubbleEl: null,
+      liveBotBubbleEl: null,
+      liveBotBuffer: "",
+    };
+
+    const els = {
+      connDot: document.getElementById("conn-dot"),
+      connLabel: document.getElementById("conn-label"),
+      apiKeyBanner: document.getElementById("api-key-banner"),
+      micBanner: document.getElementById("mic-context-banner"),
+      btnConnect: document.getElementById("btn-connect"),
+      btnMute: document.getElementById("btn-mute"),
+      btnDisconnect: document.getElementById("btn-disconnect"),
+      btnReset: document.getElementById("btn-reset"),
+      btnExport: document.getElementById("btn-export"),
+      botAudio: document.getElementById("bot-audio"),
+      simForm: document.getElementById("sim-form"),
+      simInput: document.getElementById("sim-input"),
+      btnSim: document.getElementById("btn-sim"),
+      simAudioWrap: document.getElementById("sim-audio-wrap"),
+      simAudio: document.getElementById("sim-audio"),
+      transcriptList: document.getElementById("transcript-list"),
+      transcriptEmpty: document.getElementById("transcript-empty"),
+      turnsList: document.getElementById("turns-list"),
+      kpiE2eP50: document.getElementById("kpi-e2e-p50"),
+      kpiE2eMeta: document.getElementById("kpi-e2e-meta"),
+      kpiSttP50: document.getElementById("kpi-stt-p50"),
+      kpiSttMeta: document.getElementById("kpi-stt-meta"),
+      kpiLlmP50: document.getElementById("kpi-llm-p50"),
+      kpiLlmMeta: document.getElementById("kpi-llm-meta"),
+      kpiTtsP50: document.getElementById("kpi-tts-p50"),
+      kpiTtsMeta: document.getElementById("kpi-tts-meta"),
+      kpiTurnP50: document.getElementById("kpi-turn-p50"),
+      kpiTurnMeta: document.getElementById("kpi-turn-meta"),
+    };
+
+    function fmtMs(val) {
+      if (val === null || val === undefined || Number.isNaN(Number(val))) return "—";
+      return `${Number(val).toFixed(0)}ms`;
+    }
+
+    function escapeHtml(str) {
+      return String(str ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    function setConnStatus(label, mode = "idle") {
+      els.connLabel.textContent = label;
+      els.connDot.className = "status-dot";
+      if (mode === "connected") els.connDot.classList.add("connected");
+      else if (mode === "speaking") els.connDot.classList.add("speaking");
+      else if (mode === "warn") els.connDot.classList.add("warn");
+    }
+
+    function highlightNode(nodeId, active) {
+      const node = document.getElementById(nodeId);
+      if (node) node.classList.toggle("active", Boolean(active));
+    }
+
+    function checkSecureMicContext() {
+      if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+        const host = window.location.hostname;
+        const port = window.location.port || "7860";
+        els.micBanner.hidden = false;
+        els.micBanner.innerHTML =
+          `Browser microphone capture requires HTTPS or <code>localhost</code>. ` +
+          `On Cloudtop, forward the port locally via <code>ssh -L ${escapeHtml(port)}:localhost:${escapeHtml(port)} ${escapeHtml(host)}</code> ` +
+          `and open <code>http://localhost:${escapeHtml(port)}/dashboard</code> — or use the <strong>Spoken Turn Simulator</strong> below right now!`;
+      }
+    }
+
+    function appendTranscript(role, text, { interim = false } = {}) {
+      if (!text || !text.trim()) return;
+      if (els.transcriptEmpty) els.transcriptEmpty.hidden = true;
+
+      if (role === "user" && interim) {
+        if (!state.interimBubbleEl) {
+          state.interimBubbleEl = document.createElement("div");
+          state.interimBubbleEl.className = "msg-bubble user interim";
+          els.transcriptList.appendChild(state.interimBubbleEl);
+        }
+        state.interimBubbleEl.innerHTML = `<div class="msg-role">You (live STT)</div><div>${escapeHtml(text)}</div>`;
+        els.transcriptList.scrollTop = els.transcriptList.scrollHeight;
+        return;
+      }
+
+      if (role === "user" && state.interimBubbleEl) {
+        state.interimBubbleEl.remove();
+        state.interimBubbleEl = null;
+      }
+
+      const div = document.createElement("div");
+      div.className = `msg-bubble ${role}`;
+      const label = role === "user" ? "You" : "Gemini Bot";
+      div.innerHTML = `<div class="msg-role">${label}</div><div>${escapeHtml(text)}</div>`;
+      els.transcriptList.appendChild(div);
+      els.transcriptList.scrollTop = els.transcriptList.scrollHeight;
+    }
+
+    function appendStreamingBotChunk(chunk) {
+      if (!chunk) return;
+      if (els.transcriptEmpty) els.transcriptEmpty.hidden = true;
+      state.liveBotBuffer += chunk;
+      if (!state.liveBotBubbleEl) {
+        state.liveBotBubbleEl = document.createElement("div");
+        state.liveBotBubbleEl.className = "msg-bubble assistant";
+        els.transcriptList.appendChild(state.liveBotBubbleEl);
+      }
+      state.liveBotBubbleEl.innerHTML =
+        `<div class="msg-role">Gemini Bot</div><div>${escapeHtml(state.liveBotBuffer)}</div>`;
+      els.transcriptList.scrollTop = els.transcriptList.scrollHeight;
+    }
+
+    function finalizeStreamingBotBubble() {
+      state.liveBotBubbleEl = null;
+      state.liveBotBuffer = "";
+    }
+
+    function renderSummary(summary) {
+      state.summary = summary;
+      if (!summary || summary.user_turn_count === 0) {
+        els.kpiE2eP50.textContent = "—";
+        els.kpiE2eMeta.textContent = `n=0 user turns${summary?.greeting_count ? ` (${summary.greeting_count} greeting)` : ""}`;
+        els.kpiSttP50.textContent = "—";
+        els.kpiSttMeta.textContent = "STT TTFB P50: — · P95: —";
+        els.kpiLlmP50.textContent = "—";
+        els.kpiLlmMeta.textContent = "TTFAT P50: — · Stream: —";
+        els.kpiTtsP50.textContent = "—";
+        els.kpiTtsMeta.textContent = "TTFA P50: — · Sent Agg: —";
+        els.kpiTurnP50.textContent = "—";
+        els.kpiTurnMeta.textContent = "VAD: — · Turn: — · Out: —";
+        return;
+      }
+
+      els.kpiE2eP50.textContent = fmtMs(summary.e2e_from_user_silence.p50_ms);
+      els.kpiE2eMeta.textContent =
+        `n=${summary.user_turn_count} · P95 ${fmtMs(summary.e2e_from_user_silence.p95_ms)} · Net ${fmtMs(summary.e2e_from_vad_stop.p50_ms)}`;
+
+      els.kpiSttP50.textContent = fmtMs(summary.stt_finalize.p50_ms);
+      els.kpiSttMeta.textContent =
+        `TTFB ${fmtMs(summary.stt_ttfb.p50_ms)} · P95 ${fmtMs(summary.stt_finalize.p95_ms)}`;
+
+      els.kpiLlmP50.textContent = fmtMs(summary.llm_ttfb.p50_ms);
+      els.kpiLlmMeta.textContent =
+        `TTFAT ${fmtMs(summary.llm_ttfat.p50_ms)} · Total ${fmtMs(summary.llm_total_processing.p50_ms)}`;
+
+      els.kpiTtsP50.textContent = fmtMs(summary.tts_ttfb.p50_ms);
+      els.kpiTtsMeta.textContent =
+        `TTFA ${fmtMs(summary.tts_ttfa.p50_ms)} · Agg ${fmtMs(summary.sentence_aggregation.p50_ms)}`;
+
+      const overheadSum =
+        (summary.endpointing_wait.p50_ms || 0) +
+        (summary.turn_detection.p50_ms || 0) +
+        (summary.output_transport.p50_ms || 0);
+      els.kpiTurnP50.textContent = fmtMs(overheadSum);
+      els.kpiTurnMeta.textContent =
+        `VAD ${fmtMs(summary.endpointing_wait.p50_ms)} · Turn ${fmtMs(summary.turn_detection.p50_ms)} · Out ${fmtMs(summary.output_transport.p50_ms)}`;
+    }
+
+    function renderTurns() {
+      const turns = Array.from(state.turnsById.values()).sort((a, b) => {
+        if (a.timestamp_utc !== b.timestamp_utc) {
+          return b.timestamp_utc.localeCompare(a.timestamp_utc);
+        }
+        return b.turn_index - a.turn_index;
+      });
+
+      if (turns.length === 0) {
+        els.turnsList.innerHTML = `
+          <div class="empty-state">
+            No turns recorded yet. Every spoken question will render a proportional critical-path waterfall and per-block latency breakdown here.
+          </div>`;
+        return;
+      }
+
+      els.turnsList.innerHTML = turns.map((turn) => {
+        const total = Math.max(turn.e2e_from_user_silence_ms || 1, 1);
+        const isGreeting = turn.turn_type === "greeting";
+        const badgeText = isGreeting
+          ? `GREETING · #${turn.turn_index}`
+          : `USER TURN · #${turn.turn_index}`;
+
+        const barsHtml = (turn.waterfall || []).map((stage) => {
+          const leftPct = Math.min(99.5, Math.max(0, (stage.offset_ms / total) * 100));
+          const widthPct = Math.max(0.6, Math.min(100 - leftPct, (stage.duration_ms / total) * 100));
+          const color = STAGE_COLORS[stage.key] || "var(--c-pipe)";
+          const inlineLabel = widthPct >= 10 ? `${Math.round(stage.duration_ms)}ms` : "";
+          return `<div
+            class="wf-segment"
+            style="inset-inline-start:${leftPct.toFixed(2)}%; inline-size:${widthPct.toFixed(2)}%; background:${color};"
+            title="${escapeHtml(stage.label)} (${escapeHtml(stage.owner)}): ${stage.duration_ms.toFixed(1)}ms (${stage.share_pct}%)"
+          >${inlineLabel}</div>`;
+        }).join("");
+
+        return `
+          <article class="turn-card">
+            <div class="turn-top">
+              <div>
+                <span class="turn-badge ${isGreeting ? "greeting" : ""}">${badgeText}</span>
+                <span style="font-size:0.74rem; color:var(--text-muted); margin-inline-start:0.45rem;">
+                  session ${escapeHtml(turn.session_id.slice(0, 8))}${turn.interrupted ? " · interrupted" : ""}
+                </span>
+              </div>
+              <div class="turn-e2e">
+                E2E ${fmtMs(turn.e2e_from_user_silence_ms)}
+                <span style="font-weight:500; font-size:0.76rem; color:var(--text-muted);">
+                  (net ex-VAD: ${fmtMs(turn.e2e_from_vad_stop_ms)})
+                </span>
+              </div>
+            </div>
+
+            <div class="turn-utterances">
+              ${turn.user_transcript ? `<div><strong>User:</strong> ${escapeHtml(turn.user_transcript)}</div>` : ""}
+              ${turn.assistant_transcript ? `<div><strong>Bot:</strong> ${escapeHtml(turn.assistant_transcript)}</div>` : ""}
+            </div>
+
+            <div class="waterfall-track" role="img" aria-label="Turn latency waterfall">
+              ${barsHtml}
+            </div>
+
+            <div class="stage-metrics-grid">
+              <div class="stage-cell">
+                <div class="stage-cell-head"><span>VAD + Endpoint</span><span>Silero + Turn</span></div>
+                <div class="stage-cell-val">${fmtMs(turn.endpointing_wait_ms)} + ${fmtMs(turn.turn_detection_ms)}</div>
+                <div style="color:var(--text-muted); font-size:0.7rem;">
+                  SmartTurn: ${fmtMs(turn.smart_turn_e2e_ms)}${turn.smart_turn_probability != null ? ` (p=${turn.smart_turn_probability.toFixed(2)})` : ""}
+                </div>
+              </div>
+
+              <div class="stage-cell">
+                <div class="stage-cell-head"><span>1 · Live STT</span><span>Finalize / TTFB</span></div>
+                <div class="stage-cell-val">${fmtMs(turn.stt_finalize_ms)} / ${fmtMs(turn.stt_ttfb_ms)}</div>
+                <div style="color:var(--text-muted); font-size:0.7rem;">
+                  Stream: ${fmtMs(turn.stt_utterance_processing_ms)}
+                </div>
+              </div>
+
+              <div class="stage-cell">
+                <div class="stage-cell-head"><span>2 · Flash-Lite LLM</span><span>TTFB / Total</span></div>
+                <div class="stage-cell-val">${fmtMs(turn.llm_ttfb_ms)} / ${fmtMs(turn.llm_total_processing_ms)}</div>
+                <div style="color:var(--text-muted); font-size:0.7rem;">
+                  TTFAT: ${fmtMs(turn.llm_ttfat_ms)} · Tokens: ${turn.llm_prompt_tokens ?? "—"}&rarr;${turn.llm_completion_tokens ?? "—"}
+                </div>
+              </div>
+
+              <div class="stage-cell">
+                <div class="stage-cell-head"><span>3 · Flash-Lite TTS</span><span>TTFB / TTFA</span></div>
+                <div class="stage-cell-val">${fmtMs(turn.tts_ttfb_ms)} / ${fmtMs(turn.tts_ttfa_ms)}</div>
+                <div style="color:var(--text-muted); font-size:0.7rem;">
+                  SentAgg: ${fmtMs(turn.sentence_aggregation_ms)} · Total: ${fmtMs(turn.tts_total_processing_ms)}
+                </div>
+              </div>
+            </div>
+          </article>`;
+      }).join("");
+    }
+
+    function upsertTurnAndRender(turn, summary) {
+      if (turn && turn.turn_id) {
+        state.turnsById.set(turn.turn_id, turn);
+      }
+      if (summary) {
+        renderSummary(summary);
+      }
+      renderTurns();
+    }
+
+    async function loadInitialState() {
+      try {
+        const [cfgRes, latRes] = await Promise.all([
+          fetch("/api/config"),
+          fetch("/api/latency"),
+        ]);
+        if (cfgRes.ok) {
+          const cfg = await cfgRes.json();
+          state.config = cfg;
+          document.getElementById("model-vad").textContent =
+            `Silero VAD (${Number(cfg.turn_detection.vad_stop_secs).toFixed(2)}s)`;
+          document.getElementById("model-stt").textContent =
+            `${cfg.stt.model} (${cfg.stt.mode})`;
+          document.getElementById("model-turn").textContent =
+            cfg.turn_detection.turn_stop_mode === "vad" ? "Pure VAD Timeout" : "SmartTurn v3 ONNX";
+          document.getElementById("model-llm").textContent =
+            `${cfg.llm.model} (${cfg.llm.thinking_level})`;
+          document.getElementById("model-tts").textContent =
+            `${cfg.tts.model} (${cfg.tts.voice})`;
+
+          if (!cfg.api_key_configured) {
+            els.apiKeyBanner.hidden = false;
+            els.apiKeyBanner.innerHTML =
+              `<strong>GOOGLE_API_KEY not configured yet:</strong> Add your Gemini API key to ` +
+              `<code>${escapeHtml(cfg.env_file)}</code> and click Connect or Run Turn (config reloads automatically per session).`;
+          } else {
+            els.apiKeyBanner.hidden = true;
+          }
+        }
+
+        if (latRes.ok) {
+          const snap = await latRes.json();
+          state.turnsById.clear();
+          for (const t of snap.turns || []) {
+            state.turnsById.set(t.turn_id, t);
+          }
+          renderSummary(snap.summary);
+          renderTurns();
+        }
+      } catch (err) {
+        console.error("Failed to fetch initial state:", err);
+      }
+    }
+
+    async function connectWebRTC() {
+      els.btnConnect.disabled = true;
+      setConnStatus("Loading Pipecat RTVI SDK…", "warn");
+
+      try {
+        const [{ PipecatClient }, { SmallWebRTCTransport }] = await Promise.all([
+          import("https://esm.sh/@pipecat-ai/client-js@1"),
+          import("https://esm.sh/@pipecat-ai/small-webrtc-transport@1"),
+        ]);
+
+        const transport = new SmallWebRTCTransport({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        });
+
+        const pcClient = new PipecatClient({
+          transport,
+          enableCam: false,
+          enableMic: true,
+          callbacks: {
+            onConnected: () => {
+              setConnStatus("WebRTC Connected", "connected");
+              els.btnDisconnect.disabled = false;
+              els.btnMute.disabled = false;
+              state.micEnabled = true;
+              els.btnMute.textContent = "Mute Mic";
+            },
+            onBotReady: () => {
+              setConnStatus("Bot Ready · Listening", "connected");
+            },
+            onDisconnected: () => {
+              setConnStatus("Disconnected", "idle");
+              els.btnConnect.disabled = false;
+              els.btnDisconnect.disabled = true;
+              els.btnMute.disabled = true;
+              finalizeStreamingBotBubble();
+            },
+            onError: (err) => {
+              console.error("Pipecat RTVI error:", err);
+              setConnStatus("Connection Error", "warn");
+              els.btnConnect.disabled = false;
+            },
+            onTrackStarted: (track, participant) => {
+              if (track.kind === "audio" && (!participant || !participant.local)) {
+                els.botAudio.srcObject = new MediaStream([track]);
+                els.botAudio.play().catch((e) => console.warn("Audio autoplay blocked:", e));
+              }
+            },
+            onUserStartedSpeaking: () => {
+              highlightNode("node-vad", true);
+              highlightNode("node-stt", true);
+              setConnStatus("User Speaking…", "speaking");
+            },
+            onUserStoppedSpeaking: () => {
+              highlightNode("node-vad", false);
+              highlightNode("node-turn", true);
+              setConnStatus("Processing Turn…", "speaking");
+            },
+            onUserTranscript: (data) => {
+              if (!data) return;
+              appendTranscript("user", data.text || "", { interim: !data.final });
+              if (data.final) {
+                highlightNode("node-stt", false);
+                highlightNode("node-llm", true);
+              }
+            },
+            onBotLlmText: (data) => {
+              highlightNode("node-turn", false);
+              highlightNode("node-llm", true);
+              if (data?.text) appendStreamingBotChunk(data.text);
+            },
+            onBotStartedSpeaking: () => {
+              highlightNode("node-llm", false);
+              highlightNode("node-tts", true);
+              setConnStatus("Bot Speaking", "speaking");
+            },
+            onBotStoppedSpeaking: () => {
+              highlightNode("node-tts", false);
+              finalizeStreamingBotBubble();
+              setConnStatus("Bot Ready · Listening", "connected");
+            },
+            onServerMessage: (payload) => {
+              const msg = payload?.data?.type ? payload.data : payload;
+              if (
+                msg &&
+                (msg.type === "cascade_latency" || msg.type === "cascade_latency_update")
+              ) {
+                upsertTurnAndRender(msg.turn, msg.summary);
+              }
+            },
+          },
+        });
+
+        state.pcClient = pcClient;
+        setConnStatus("Negotiating WebRTC…", "warn");
+        await pcClient.startBotAndConnect({
+          endpoint: "/start",
+          requestData: {
+            transport: "webrtc",
+            enableDefaultIceServers: true,
+          },
+        });
+      } catch (err) {
+        console.error("Failed to start WebRTC session:", err);
+        setConnStatus("Connect Failed", "warn");
+        els.btnConnect.disabled = false;
+        alert(`Could not start WebRTC voice session: ${err?.message || err}`);
+      }
+    }
+
+    async function disconnectWebRTC() {
+      if (!state.pcClient) return;
+      try {
+        await state.pcClient.disconnect();
+      } catch (err) {
+        console.warn("Disconnect warning:", err);
+      } finally {
+        state.pcClient = null;
+        els.btnConnect.disabled = false;
+        els.btnDisconnect.disabled = true;
+        els.btnMute.disabled = true;
+        setConnStatus("Disconnected", "idle");
+      }
+    }
+
+    els.btnConnect.addEventListener("click", connectWebRTC);
+    els.btnDisconnect.addEventListener("click", disconnectWebRTC);
+
+    els.btnMute.addEventListener("click", () => {
+      if (!state.pcClient) return;
+      state.micEnabled = !state.micEnabled;
+      state.pcClient.enableMic(state.micEnabled);
+      els.btnMute.textContent = state.micEnabled ? "Mute Mic" : "Unmute Mic";
+    });
+
+    els.simForm.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const question = els.simInput.value.trim();
+      if (!question) return;
+
+      els.btnSim.disabled = true;
+      const prevLabel = els.btnSim.textContent;
+      els.btnSim.textContent = "Streaming…";
+      highlightNode("node-stt", true);
+      highlightNode("node-llm", true);
+      highlightNode("node-tts", true);
+
+      try {
+        const res = await fetch("/api/simulate-turn", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question }),
+        });
+        const body = await res.json();
+        if (!res.ok) {
+          throw new Error(body?.detail || `HTTP ${res.status}`);
+        }
+        appendTranscript("user", body.turn?.user_transcript || question);
+        if (body.turn?.assistant_transcript) {
+          appendTranscript("assistant", body.turn.assistant_transcript);
+        }
+        upsertTurnAndRender(body.turn, body.summary);
+
+        if (body.bot_audio_wav_base64) {
+          els.simAudioWrap.hidden = false;
+          els.simAudio.src = `data:audio/wav;base64,${body.bot_audio_wav_base64}`;
+          els.simAudio.play().catch(() => {});
+        }
+        await loadInitialState();
+      } catch (err) {
+        alert(`Simulation error: ${err?.message || err}`);
+      } finally {
+        els.btnSim.disabled = false;
+        els.btnSim.textContent = prevLabel;
+        highlightNode("node-stt", false);
+        highlightNode("node-llm", false);
+        highlightNode("node-tts", false);
+      }
+    });
+
+    document.querySelectorAll(".chip[data-q]").forEach((chip) => {
+      chip.addEventListener("click", () => {
+        els.simInput.value = chip.getAttribute("data-q") || "";
+        els.simInput.focus();
+      });
+    });
+
+    els.btnReset.addEventListener("click", async () => {
+      await fetch("/api/latency/reset", { method: "POST" });
+      state.turnsById.clear();
+      renderSummary(null);
+      renderTurns();
+    });
+
+    els.btnExport.addEventListener("click", async () => {
+      const res = await fetch("/api/latency");
+      const data = await res.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `cascade-latency-${new Date().toISOString().slice(0, 19).replaceAll(":", "-")}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    // Periodic lightweight sync so CLI benchmark runs or multi-tab sessions appear live
+    setInterval(async () => {
+      try {
+        const res = await fetch("/api/latency");
+        if (!res.ok) return;
+        const snap = await res.json();
+        if ((snap.turns || []).length !== state.turnsById.size) {
+          state.turnsById.clear();
+          for (const t of snap.turns || []) state.turnsById.set(t.turn_id, t);
+          renderSummary(snap.summary);
+          renderTurns();
+        }
+      } catch (_) {}
+    }, 4000);
+
+    checkSecureMicContext();
+    loadInitialState();
+  </script>
+</body>
+</html>
