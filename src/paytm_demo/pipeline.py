@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from loguru import logger
@@ -15,11 +16,13 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.serializers.protobuf import ProtobufFrameSerializer
 from pipecat.services.google.gemini_live.stt import GeminiSTTService
 from pipecat.services.google.llm import GoogleLLMService
 from pipecat.services.google.tts import GeminiTTSService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
@@ -39,6 +42,18 @@ def build_transport_params(cfg: CascadeConfig) -> TransportParams:
         audio_in_sample_rate=cfg.audio_in_sample_rate,
         audio_out_enabled=True,
         audio_out_sample_rate=cfg.audio_out_sample_rate,
+    )
+
+
+def build_websocket_params(cfg: CascadeConfig) -> FastAPIWebsocketParams:
+    """Build FastAPI WebSocket transport params with Protobuf RTVI + raw PCM framing."""
+    return FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_in_sample_rate=cfg.audio_in_sample_rate,
+        audio_out_enabled=True,
+        audio_out_sample_rate=cfg.audio_out_sample_rate,
+        add_wav_header=False,
+        serializer=ProtobufFrameSerializer(),
     )
 
 
@@ -157,22 +172,52 @@ def create_cascade_session(
     )
     monitor.attach_worker(worker)
 
+    greeted = False
+    disconnected = False
+    greeting_fallback_task: asyncio.Task[None] | None = None
+
+    async def _trigger_greeting_once() -> None:
+        nonlocal greeted
+        if not should_greet or greeted or disconnected:
+            return
+        greeted = True
+        await worker.queue_frame(
+            LLMMessagesAppendFrame(
+                messages=[{"role": "user", "content": GREETING_PROMPT}],
+                run_llm=True,
+            )
+        )
+
+    if worker.rtvi is not None:
+
+        @worker.rtvi.event_handler("on_client_ready")
+        async def _on_client_ready(_rtvi: object) -> None:
+            await _trigger_greeting_once()
+
     @transport.event_handler("on_client_connected")
     async def _on_client_connected(_transport: BaseTransport, _client: object) -> None:
+        nonlocal greeting_fallback_task
         logger.info(
             f"[{resolved_session_id}] Client connected "
             f"(STT={cfg.stt_model} -> LLM={cfg.llm_model} -> TTS={cfg.tts_model})"
         )
-        if should_greet:
-            await worker.queue_frame(
-                LLMMessagesAppendFrame(
-                    messages=[{"role": "user", "content": GREETING_PROMPT}],
-                    run_llm=True,
-                )
-            )
+        if should_greet and not greeted:
+            if worker.rtvi is None:
+                await _trigger_greeting_once()
+            else:
+
+                async def _delayed_greeting() -> None:
+                    await asyncio.sleep(0.75)
+                    await _trigger_greeting_once()
+
+                greeting_fallback_task = asyncio.create_task(_delayed_greeting())
 
     @transport.event_handler("on_client_disconnected")
     async def _on_client_disconnected(_transport: BaseTransport, _client: object) -> None:
+        nonlocal disconnected
+        disconnected = True
+        if greeting_fallback_task is not None and not greeting_fallback_task.done():
+            greeting_fallback_task.cancel()
         logger.info(f"[{resolved_session_id}] Client disconnected; flushing latency metrics.")
         await monitor.flush_open_turn()
         await worker.cancel()

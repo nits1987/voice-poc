@@ -45,6 +45,7 @@ from paytm_demo.latency import CascadeLatencyMonitor, LatencyStore, format_turn_
 from paytm_demo.pipeline import (
     build_transport_params,
     build_user_aggregator_params,
+    build_websocket_params,
     create_cascade_services,
 )
 from paytm_demo.server import register_observatory_routes
@@ -460,6 +461,124 @@ class CascadeLatencyTest(unittest.IsolatedAsyncioTestCase):
             r_lat = client.get("/api/latency")
             self.assertEqual(r_lat.status_code, 200)
             self.assertEqual(r_lat.json()["summary"]["user_turn_count"], 0)
+
+    def test_start_ws_url_middleware_rewrites_0000_and_forwarded_headers(self) -> None:
+        test_app = FastAPI()
+
+        @test_app.post("/start")
+        async def fake_runner_start() -> dict[str, object]:
+            # Simulates pipecat.runner.run returning wss://0.0.0.0:7860/ws-client when --host 0.0.0.0
+            return {
+                "wsUrl": "wss://0.0.0.0:7860/ws-client",
+                "sessionId": "sess-ws-1",
+                "token": None,
+            }
+
+        store = LatencyStore(jsonl_path=None, load_existing=False)
+        register_observatory_routes(test_app, store)
+
+        with TestClient(test_app, base_url="http://localhost:7860") as client:
+            res_local = client.post("/start", json={"transport": "websocket"})
+            self.assertEqual(res_local.status_code, 200)
+            self.assertEqual(res_local.json()["wsUrl"], "ws://localhost:7860/ws-client")
+
+            res_proxy = client.post(
+                "/start",
+                json={"transport": "websocket"},
+                headers={
+                    "X-Forwarded-Proto": "https",
+                    "X-Forwarded-Host": "voice-demo.example.com",
+                },
+            )
+            self.assertEqual(res_proxy.status_code, 200)
+            self.assertEqual(
+                res_proxy.json()["wsUrl"],
+                "wss://voice-demo.example.com/ws-client",
+            )
+
+    async def test_websocket_params_and_browser_protobuf_wire_compatibility(self) -> None:
+        import json
+
+        from pipecat.frames.frames import (
+            InputAudioRawFrame,
+            InputTransportMessageFrame,
+            InterruptionFrame,
+            OutputAudioRawFrame,
+            OutputTransportMessageUrgentFrame,
+        )
+        from pipecat.serializers.protobuf import ProtobufFrameSerializer
+
+        cfg = CascadeConfig(api_key="unit-test-dummy-key")
+        ws_params = build_websocket_params(cfg)
+        self.assertTrue(ws_params.audio_in_enabled)
+        self.assertTrue(ws_params.audio_out_enabled)
+        self.assertEqual(ws_params.audio_in_sample_rate, 16000)
+        self.assertEqual(ws_params.audio_out_sample_rate, 24000)
+        self.assertFalse(ws_params.add_wav_header)
+        self.assertIsInstance(ws_params.serializer, ProtobufFrameSerializer)
+        self.assertIsInstance(ws_params.allowed_origins, list)
+
+        serializer = ws_params.serializer
+        assert serializer is not None
+
+        def _varint(n: int) -> bytes:
+            out = bytearray()
+            while n >= 0x80:
+                out.append((n & 0x7F) | 0x80)
+                n >>= 7
+            out.append(n)
+            return bytes(out)
+
+        # 1) Encode 20ms 16kHz mono PCM frame using the exact browser JS layout
+        pcm_20ms = b"\x01\x00\xff\xff" * 160  # 640 bytes (320 int16 samples)
+        inner_audio = (
+            b"\x1a" + _varint(len(pcm_20ms)) + pcm_20ms + b"\x20" + _varint(16000) + b"\x28\x01"
+        )
+        wire_audio = b"\x12" + _varint(len(inner_audio)) + inner_audio
+
+        deserialized_audio = await serializer.deserialize(wire_audio)
+        self.assertIsInstance(deserialized_audio, InputAudioRawFrame)
+        assert isinstance(deserialized_audio, InputAudioRawFrame)
+        self.assertEqual(deserialized_audio.audio, pcm_20ms)
+        self.assertEqual(deserialized_audio.sample_rate, 16000)
+        self.assertEqual(deserialized_audio.num_channels, 1)
+
+        # 2) Encode RTVI client-ready message using the exact browser JS layout
+        ready_json = json.dumps(
+            {
+                "label": "rtvi-ai",
+                "type": "client-ready",
+                "id": "ready-01",
+                "data": {
+                    "version": "2.2.0",
+                    "about": {"library": "paytm-cascade-observatory-ws"},
+                },
+            }
+        ).encode("utf-8")
+        inner_msg = b"\x0a" + _varint(len(ready_json)) + ready_json
+        wire_msg = b"\x22" + _varint(len(inner_msg)) + inner_msg
+
+        deserialized_msg = await serializer.deserialize(wire_msg)
+        self.assertIsInstance(deserialized_msg, InputTransportMessageFrame)
+        assert isinstance(deserialized_msg, InputTransportMessageFrame)
+        self.assertEqual(deserialized_msg.message["type"], "client-ready")
+        self.assertEqual(deserialized_msg.message["data"]["version"], "2.2.0")
+
+        # 3) Verify server -> browser serialization for audio, RTVI messages, and interruptions
+        out_audio_bytes = await serializer.serialize(
+            OutputAudioRawFrame(audio=b"\x02\x00" * 240, sample_rate=24000, num_channels=1)
+        )
+        self.assertIsInstance(out_audio_bytes, bytes)
+
+        out_rtvi_bytes = await serializer.serialize(
+            OutputTransportMessageUrgentFrame(
+                message={"label": "rtvi-ai", "type": "bot-ready", "id": "ready-01", "data": {}}
+            )
+        )
+        self.assertIsInstance(out_rtvi_bytes, bytes)
+
+        out_intr_bytes = await serializer.serialize(InterruptionFrame())
+        self.assertIsInstance(out_intr_bytes, bytes)
 
 
 if __name__ == "__main__":

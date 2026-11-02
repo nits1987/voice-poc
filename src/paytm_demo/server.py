@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+import os
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, RedirectResponse
 from loguru import logger
 from pipecat.runner.run import app, main as pipecat_runner_main
@@ -20,6 +24,7 @@ from paytm_demo.config import TurnStopMode, load_config
 from paytm_demo.latency import LatencyStore
 from paytm_demo.pipeline import (
     build_transport_params,
+    build_websocket_params,
     create_cascade_session,
     run_cascade_worker,
 )
@@ -45,11 +50,64 @@ class SimulateTurnRequest(BaseModel):
     )
 
 
+def rewrite_ws_url_for_request(ws_url: str, request: Request) -> str:
+    """Rewrite Pipecat Runner's `wsUrl` to match the caller's actual scheme and Host header."""
+    parsed = urlsplit(ws_url)
+    forwarded_proto = (
+        request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        or request.url.scheme.lower()
+    )
+    ws_scheme = "wss" if forwarded_proto in ("https", "wss") else "ws"
+    forwarded_host = (
+        request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+        or request.headers.get("host", "").strip()
+        or request.url.netloc
+        or parsed.netloc
+    )
+    path = parsed.path or "/ws-client"
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{ws_scheme}://{forwarded_host}{path}{query}"
+
+
 def register_observatory_routes(target_app: FastAPI, store: LatencyStore) -> None:
     """Attach the custom Latency Observatory UI and telemetry API routes to FastAPI."""
     if getattr(target_app.state, "cascade_routes_registered", False):
         return
     target_app.state.cascade_routes_registered = True
+
+    @target_app.middleware("http")
+    async def normalize_start_ws_url(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        response = await call_next(request)
+        if request.method != "POST" or request.url.path != "/start" or response.status_code != 200:
+            return response
+
+        body_chunks = [chunk async for chunk in response.body_iterator]  # type: ignore[attr-defined]
+        raw_body = b"".join(body_chunks)
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except Exception:
+            headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
+            return Response(
+                content=raw_body,
+                status_code=response.status_code,
+                headers=headers,
+                media_type=response.media_type,
+            )
+
+        if isinstance(payload, dict) and isinstance(payload.get("wsUrl"), str):
+            payload["wsUrl"] = rewrite_ws_url_for_request(payload["wsUrl"], request)
+            raw_body = json.dumps(payload).encode("utf-8")
+
+        headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
+        return Response(
+            content=raw_body,
+            status_code=response.status_code,
+            headers=headers,
+            media_type="application/json",
+        )
 
     @target_app.get("/", include_in_schema=False)
     async def root_redirect() -> RedirectResponse:
@@ -106,7 +164,7 @@ async def bot(runner_args: RunnerArguments) -> None:
 
     transport_factories = {
         "webrtc": lambda: build_transport_params(cfg),
-        "websocket": lambda: build_transport_params(cfg),
+        "websocket": lambda: build_websocket_params(cfg),
         "daily": lambda: build_transport_params(cfg),
     }
     transport = await create_transport(runner_args, transport_factories)
@@ -137,6 +195,14 @@ def run() -> None:
     main_mod = sys.modules.get("__main__")
     if main_mod is not None and not hasattr(main_mod, "bot"):
         setattr(main_mod, "bot", bot)
+
+    # Bind to 0.0.0.0 by default so both SSH localhost tunnels and Cloudtop
+    # hostname proxies can reach the server unless --host is explicitly set.
+    cli_args = sys.argv[1:]
+    has_host_flag = any(a == "--host" or a.startswith("--host=") for a in cli_args)
+    has_help_flag = any(a in ("-h", "--help") for a in cli_args)
+    if not has_host_flag and not has_help_flag:
+        sys.argv.extend(["--host", os.getenv("HOST", "0.0.0.0")])
 
     cfg = load_config()
     if not cfg.has_api_key:
