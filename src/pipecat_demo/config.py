@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
+
+from pipecat_demo.telephony import (
+    STT_PIPELINE_SAMPLE_RATE,
+    TELEPHONY_SAMPLE_RATE,
+    TTS_NATIVE_SAMPLE_RATE,
+    DialerEncoding,
+    normalize_dialer_encoding,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_PATH = PROJECT_ROOT / ".env"
@@ -32,7 +41,7 @@ def _parse_bool(raw: str | None, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class CascadeConfig:
-    """Runtime settings for the three-block Gemini voice cascade."""
+    """Runtime settings for the three-block Gemini voice cascade + 8kHz telephony converter."""
 
     api_key: str
     stt_model: str = "gemini-3.5-transcribe-live"
@@ -43,8 +52,11 @@ class CascadeConfig:
     tts_model: str = "gemini-3.8-flash-lite-tts"
     tts_voice: str = "Kore"
     tts_style_prompt: str = "Warm, clear, natural conversational voice at a brisk, helpful pace."
-    audio_in_sample_rate: int = 16000
-    audio_out_sample_rate: int = 24000
+    audio_in_sample_rate: int = STT_PIPELINE_SAMPLE_RATE
+    audio_out_sample_rate: int = TTS_NATIVE_SAMPLE_RATE
+    telephony_8k_enabled: bool = True
+    dialer_sample_rate: int = TELEPHONY_SAMPLE_RATE
+    dialer_encoding: DialerEncoding = "ulaw"
     vad_stop_secs: float = 0.2
     turn_stop_mode: TurnStopMode = "smart_turn"
     greet_on_connect: bool = True
@@ -68,6 +80,28 @@ class CascadeConfig:
             )
         return self.api_key.strip()
 
+    def with_telephony_8k(
+        self,
+        *,
+        enabled: bool = True,
+        encoding: str | None = None,
+        dialer_sample_rate: int | None = None,
+    ) -> CascadeConfig:
+        """Return a copy configured for 8kHz telephony output (or wideband 24kHz when disabled)."""
+        resolved_rate = dialer_sample_rate or self.dialer_sample_rate or TELEPHONY_SAMPLE_RATE
+        resolved_enc = (
+            normalize_dialer_encoding(encoding, default=self.dialer_encoding)
+            if encoding is not None
+            else self.dialer_encoding
+        )
+        return dataclasses.replace(
+            self,
+            telephony_8k_enabled=enabled,
+            dialer_sample_rate=resolved_rate,
+            dialer_encoding=resolved_enc,
+            audio_out_sample_rate=resolved_rate if enabled else TTS_NATIVE_SAMPLE_RATE,
+        )
+
     def public_summary(self) -> dict[str, object]:
         """Return safe configuration metadata for the Web UI and JSONL logs."""
         return {
@@ -85,7 +119,17 @@ class CascadeConfig:
             "tts": {
                 "model": self.tts_model,
                 "voice": self.tts_voice,
+                "native_sample_rate_hz": TTS_NATIVE_SAMPLE_RATE,
                 "sample_rate_hz": self.audio_out_sample_rate,
+            },
+            "telephony": {
+                "enabled": self.telephony_8k_enabled,
+                "dialer_sample_rate_hz": self.dialer_sample_rate,
+                "dialer_encoding": self.dialer_encoding,
+                "input_converter": f"{self.dialer_sample_rate}Hz -> {self.audio_in_sample_rate}Hz (SOXR)",
+                "output_converter": f"{TTS_NATIVE_SAMPLE_RATE}Hz -> {self.dialer_sample_rate}Hz (SOXR)",
+                "supported_dialers": ["twilio", "exotel", "plivo", "telnyx", "ws-dialer"],
+                "supported_codecs": ["ulaw", "alaw", "pcm16"],
             },
             "turn_detection": {
                 "vad_stop_secs": self.vad_stop_secs,
@@ -115,6 +159,14 @@ def load_config(*, override_env: bool = True) -> CascadeConfig:
     except ValueError:
         vad_stop_secs = 0.2
 
+    try:
+        dialer_sample_rate = int(os.getenv("DIALER_SAMPLE_RATE", str(TELEPHONY_SAMPLE_RATE)))
+    except ValueError:
+        dialer_sample_rate = TELEPHONY_SAMPLE_RATE
+
+    telephony_8k_enabled = _parse_bool(os.getenv("TELEPHONY_8K_ENABLED"), default=True)
+    dialer_encoding = normalize_dialer_encoding(os.getenv("DIALER_ENCODING"), default="ulaw")
+
     return CascadeConfig(
         api_key=api_key,
         stt_model=(os.getenv("GEMINI_STT_MODEL") or "gemini-3.5-transcribe-live").strip(),
@@ -130,6 +182,9 @@ def load_config(*, override_env: bool = True) -> CascadeConfig:
             os.getenv("GEMINI_TTS_STYLE")
             or "Warm, clear, natural conversational voice at a brisk, helpful pace."
         ).strip(),
+        telephony_8k_enabled=telephony_8k_enabled,
+        dialer_sample_rate=dialer_sample_rate,
+        dialer_encoding=dialer_encoding,
         vad_stop_secs=vad_stop_secs,
         turn_stop_mode=turn_mode,
         greet_on_connect=_parse_bool(os.getenv("GREET_ON_CONNECT"), default=True),

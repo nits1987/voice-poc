@@ -580,6 +580,270 @@ class CascadeLatencyTest(unittest.IsolatedAsyncioTestCase):
         out_intr_bytes = await serializer.serialize(InterruptionFrame())
         self.assertIsInstance(out_intr_bytes, bytes)
 
+    async def test_8k_to_16k_and_24k_to_8k_pcm_and_g711_codecs(self) -> None:
+        import math
+
+        from pipecat_demo.telephony import (
+            convert_8k_to_16k_pcm,
+            convert_24k_to_8k_pcm,
+            encode_dialer_audio_from_pcm,
+            simulate_pstn_8k_roundtrip,
+        )
+
+        # 1) Generate 100ms of a 440Hz sine tone at 8kHz (800 samples = 1600 bytes PCM16LE)
+        samples_8k = [
+            int(12000 * math.sin(2.0 * math.pi * 440.0 * (i / 8000.0))) for i in range(800)
+        ]
+        pcm_8k = struct.pack(f"<{len(samples_8k)}h", *samples_8k)
+
+        # Upsample 8kHz PCM16 -> 16kHz PCM16 (expect ~1600 samples = 3200 bytes)
+        pcm_16k = await convert_8k_to_16k_pcm(pcm_8k, encoding="pcm16", in_rate=8000, out_rate=16000)
+        self.assertEqual(len(pcm_16k) % 2, 0)
+        self.assertGreaterEqual(len(pcm_16k), 3100)
+        self.assertLessEqual(len(pcm_16k), 3260)
+
+        # 2) Generate 100ms of a 440Hz sine tone at 24kHz (2400 samples = 4800 bytes PCM16LE)
+        samples_24k = [
+            int(12000 * math.sin(2.0 * math.pi * 440.0 * (i / 24000.0))) for i in range(2400)
+        ]
+        pcm_24k = struct.pack(f"<{len(samples_24k)}h", *samples_24k)
+
+        # Downsample 24kHz TTS PCM -> 8kHz dialer PCM (expect ~800 samples = 1600 bytes)
+        down_8k = await convert_24k_to_8k_pcm(pcm_24k, in_rate=24000, out_rate=8000)
+        self.assertEqual(len(down_8k) % 2, 0)
+        self.assertGreaterEqual(len(down_8k), 1560)
+        self.assertLessEqual(len(down_8k), 1640)
+
+        # 3) Encode 24kHz PCM -> 8kHz G.711 ulaw & alaw (1 byte per 8kHz sample = ~800 bytes)
+        ulaw_8k = await encode_dialer_audio_from_pcm(
+            pcm_24k, in_rate=24000, out_rate=8000, encoding="ulaw"
+        )
+        alaw_8k = await encode_dialer_audio_from_pcm(
+            pcm_24k, in_rate=24000, out_rate=8000, encoding="alaw"
+        )
+        self.assertGreaterEqual(len(ulaw_8k), 780)
+        self.assertLessEqual(len(ulaw_8k), 820)
+        self.assertEqual(len(ulaw_8k), len(alaw_8k))
+
+        # Decode 8kHz ulaw & alaw -> 16kHz PCM16LE for Gemini Live STT
+        from_ulaw_16k = await convert_8k_to_16k_pcm(ulaw_8k, encoding="ulaw")
+        from_alaw_16k = await convert_8k_to_16k_pcm(alaw_8k, encoding="alaw")
+        self.assertGreaterEqual(len(from_ulaw_16k), 3100)
+        self.assertGreaterEqual(len(from_alaw_16k), 3100)
+
+        # 4) Verify PSTN 8kHz roundtrip helper returns 8kHz PCM16LE
+        pstn_8k = await simulate_pstn_8k_roundtrip(pcm_16k, encoding="ulaw")
+        self.assertEqual(len(pstn_8k) % 2, 0)
+        self.assertGreaterEqual(len(pstn_8k), 1500)
+
+    async def test_telephony_8k_input_and_output_pipeline_processors(self) -> None:
+        from pipecat.frames.frames import (
+            CancelFrame,
+            Frame,
+            InputAudioRawFrame,
+            TTSStoppedFrame,
+        )
+
+        from pipecat_demo.telephony import Telephony8kInputConverter, Telephony8kOutputConverter
+
+        in_conv = Telephony8kInputConverter(target_sample_rate=16000)
+        captured_in: list[Frame] = []
+
+        async def _capture_in(frame: Frame, _direction: FrameDirection) -> None:
+            captured_in.append(frame)
+
+        in_conv.push_frame = _capture_in  # type: ignore[method-assign]
+
+        # Feed five 20ms 8kHz frames (320 bytes each = 160 samples @ 8kHz)
+        chunk_8k = b"\x20\x00\xe0\xff" * 80  # 320 bytes
+        for _ in range(5):
+            await in_conv.process_frame(
+                InputAudioRawFrame(audio=chunk_8k, sample_rate=8000, num_channels=1),
+                FrameDirection.DOWNSTREAM,
+            )
+
+        self.assertEqual(in_conv.telemetry.frames_converted, 5)
+        self.assertEqual(in_conv.telemetry.frames_passthrough, 0)
+        self.assertTrue(all(isinstance(f, InputAudioRawFrame) for f in captured_in))
+        self.assertTrue(
+            all(isinstance(f, InputAudioRawFrame) and f.sample_rate == 16000 for f in captured_in)
+        )
+        total_upsampled_bytes = sum(
+            len(f.audio) for f in captured_in if isinstance(f, InputAudioRawFrame)
+        )
+        # 5 * 320 bytes @ 8kHz = 1600 bytes -> ~3200 bytes @ 16kHz
+        self.assertGreaterEqual(total_upsampled_bytes, 2800)
+
+        # Feed an already-16kHz frame -> should pass through without conversion
+        chunk_16k = b"\x10\x00" * 320
+        await in_conv.process_frame(
+            InputAudioRawFrame(audio=chunk_16k, sample_rate=16000, num_channels=1),
+            FrameDirection.DOWNSTREAM,
+        )
+        self.assertEqual(in_conv.telemetry.frames_passthrough, 1)
+
+        # Output converter: 24kHz TTSAudioRawFrame -> 8kHz TTSAudioRawFrame + flush on TTSStoppedFrame
+        out_conv = Telephony8kOutputConverter(enabled=True, target_sample_rate=8000)
+        captured_out: list[Frame] = []
+
+        async def _capture_out(frame: Frame, _direction: FrameDirection) -> None:
+            captured_out.append(frame)
+
+        out_conv.push_frame = _capture_out  # type: ignore[method-assign]
+
+        chunk_24k = b"\x30\x00\xd0\xff" * 240  # 960 bytes (20ms @ 24kHz)
+        for _ in range(5):
+            tts_frame = TTSAudioRawFrame(
+                audio=chunk_24k,
+                sample_rate=24000,
+                num_channels=1,
+                context_id="ctx-tele-1",
+            )
+            await out_conv.process_frame(tts_frame, FrameDirection.DOWNSTREAM)
+
+        await out_conv.process_frame(TTSStoppedFrame(context_id="ctx-tele-1"), FrameDirection.DOWNSTREAM)
+
+        # Verify all emitted audio frames are 8000Hz TTSAudioRawFrames and TTSStoppedFrame comes last
+        self.assertIsInstance(captured_out[-1], TTSStoppedFrame)
+        audio_out_frames = [f for f in captured_out if isinstance(f, TTSAudioRawFrame)]
+        self.assertGreaterEqual(len(audio_out_frames), 5)
+        for af in audio_out_frames:
+            self.assertEqual(af.sample_rate, 8000)
+            self.assertEqual(af.context_id, "ctx-tele-1")
+        total_downsampled_bytes = sum(len(af.audio) for af in audio_out_frames)
+        # 5 * 960 bytes @ 24kHz = 4800 bytes -> exactly 1600 bytes @ 8kHz after flush
+        self.assertEqual(total_downsampled_bytes, 1600)
+
+        # CancelFrame resets pending tail cleanly
+        await out_conv.process_frame(CancelFrame(), FrameDirection.DOWNSTREAM)
+        self.assertFalse(out_conv._has_pending_tail)
+
+    async def test_dialer_8k_frame_serializer_and_provider_factories(self) -> None:
+        import base64
+        import json
+
+        from pipecat.frames.frames import (
+            InputAudioRawFrame,
+            InputDTMFFrame,
+            InterruptionFrame,
+            OutputAudioRawFrame,
+        )
+        from pipecat.processors.frame_processor import FrameProcessorSetup
+
+        from pipecat_demo.telephony import Dialer8kFrameSerializer, build_provider_serializer
+
+        serializer = Dialer8kFrameSerializer(
+            stream_sid="init-sid",
+            params=Dialer8kFrameSerializer.InputParams(
+                dialer_sample_rate=8000,
+                sample_rate=16000,
+                encoding="ulaw",
+            ),
+        )
+        await serializer.setup(
+            FrameProcessorSetup(
+                clock=None,  # type: ignore[arg-type]
+                task_manager=None,  # type: ignore[arg-type]
+                pipeline_worker=None,  # type: ignore[arg-type]
+                audio_in_sample_rate=16000,
+                audio_out_sample_rate=8000,
+            )
+        )
+
+        # 1) Start handshake updates stream_sid and codec
+        start_msg = json.dumps(
+            {
+                "event": "start",
+                "start": {
+                    "streamSid": "stream-abc",
+                    "callSid": "call-xyz",
+                    "mediaFormat": {"encoding": "ulaw", "sampleRate": 8000},
+                },
+            }
+        )
+        self.assertIsNone(await serializer.deserialize(start_msg))
+
+        # 2) Serialize 24kHz OutputAudioRawFrame -> JSON base64 8kHz ulaw media event
+        out_raw = await serializer.serialize(
+            OutputAudioRawFrame(audio=b"\x10\x00" * 480, sample_rate=24000, num_channels=1)
+        )
+        self.assertIsInstance(out_raw, str)
+        out_obj = json.loads(str(out_raw))
+        self.assertEqual(out_obj["event"], "media")
+        self.assertEqual(out_obj["streamSid"], "stream-abc")
+        self.assertEqual(out_obj["media"]["codec"], "ulaw")
+        self.assertEqual(out_obj["media"]["sampleRate"], 8000)
+
+        # 3) Deserialize that JSON media event back -> 16kHz InputAudioRawFrame
+        in_frame = await serializer.deserialize(str(out_raw))
+        self.assertIsInstance(in_frame, InputAudioRawFrame)
+        assert isinstance(in_frame, InputAudioRawFrame)
+        self.assertEqual(in_frame.sample_rate, 16000)
+        self.assertGreater(len(in_frame.audio), 0)
+
+        # 4) DTMF and Interruption events
+        dtmf_frame = await serializer.deserialize(
+            json.dumps({"event": "dtmf", "dtmf": {"digit": "9"}})
+        )
+        self.assertIsInstance(dtmf_frame, InputDTMFFrame)
+
+        clear_str = await serializer.serialize(InterruptionFrame())
+        self.assertEqual(json.loads(str(clear_str))["event"], "clear")
+
+        # 5) Binary mode (e.g. Asterisk AudioSocket / FreeSWITCH raw 8kHz PCM16)
+        bin_serializer = Dialer8kFrameSerializer(
+            params=Dialer8kFrameSerializer.InputParams(
+                dialer_sample_rate=8000,
+                sample_rate=16000,
+                encoding="pcm16",
+                wire_format="binary",
+            )
+        )
+        in_bin = await bin_serializer.deserialize(b"\x10\x00" * 160)
+        self.assertIsInstance(in_bin, InputAudioRawFrame)
+        out_bin = await bin_serializer.serialize(
+            OutputAudioRawFrame(audio=b"\x10\x00" * 480, sample_rate=24000, num_channels=1)
+        )
+        self.assertIsInstance(out_bin, bytes)
+
+        # 6) Verify provider serializer factories construct cleanly without REST credentials in .env
+        for provider in ("twilio", "exotel", "plivo", "telnyx", "unknown"):
+            prov_ser = build_provider_serializer(
+                provider,
+                {"stream_id": "s-1", "call_id": "c-1", "outbound_encoding": "PCMU"},
+            )
+            self.assertIsNotNone(prov_ser)
+
+    def test_telephony_http_and_twiml_routes(self) -> None:
+        test_app = FastAPI()
+        store = LatencyStore(jsonl_path=None, load_existing=False)
+        register_observatory_routes(test_app, store)
+
+        with TestClient(test_app, base_url="http://localhost:7860") as client:
+            r_cfg = client.get("/api/config")
+            self.assertEqual(r_cfg.status_code, 200)
+            tele_cfg = r_cfg.json()["telephony"]
+            self.assertEqual(tele_cfg["dialer_sample_rate_hz"], 8000)
+            self.assertIn("8000Hz -> 16000Hz", tele_cfg["input_converter"])
+            self.assertIn("24000Hz -> 8000Hz", tele_cfg["output_converter"])
+
+            r_tele = client.get("/api/telephony")
+            self.assertEqual(r_tele.status_code, 200)
+            tele_info = r_tele.json()
+            self.assertEqual(tele_info["dialer_sample_rate_hz"], 8000)
+            self.assertEqual(tele_info["stt_pipeline_sample_rate_hz"], 16000)
+            self.assertIn("/ws-dialer", tele_info["endpoints"]["universal_dialer_8k_ws"])
+
+            r_twiml = client.post(
+                "/twiml",
+                headers={
+                    "X-Forwarded-Proto": "https",
+                    "X-Forwarded-Host": "tele-demo.example.com",
+                },
+            )
+            self.assertEqual(r_twiml.status_code, 200)
+            self.assertIn('wss://tele-demo.example.com/ws', r_twiml.text)
+
 
 if __name__ == "__main__":
     unittest.main()

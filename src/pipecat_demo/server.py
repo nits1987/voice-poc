@@ -6,27 +6,37 @@ import dataclasses
 import json
 import os
 import sys
+import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import FileResponse, RedirectResponse
 from loguru import logger
 from pipecat.runner.run import app, main as pipecat_runner_main
-from pipecat.runner.types import RunnerArguments
-from pipecat.runner.utils import create_transport
+from pipecat.runner.types import RunnerArguments, WebSocketRunnerArguments
+from pipecat.runner.utils import create_transport, parse_telephony_websocket
+from pipecat.transports.base_transport import BaseTransport
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport
 from pydantic import BaseModel, Field
 
 from pipecat_demo.benchmark import run_simulated_voice_turn
-from pipecat_demo.config import TurnStopMode, load_config
+from pipecat_demo.config import CascadeConfig, TurnStopMode, load_config
 from pipecat_demo.latency import LatencyStore
 from pipecat_demo.pipeline import (
+    build_telephony_websocket_params,
     build_transport_params,
     build_websocket_params,
     create_cascade_session,
     run_cascade_worker,
+)
+from pipecat_demo.telephony import (
+    TELEPHONY_SAMPLE_RATE,
+    Dialer8kFrameSerializer,
+    build_provider_serializer,
+    normalize_dialer_encoding,
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -42,11 +52,19 @@ class SimulateTurnRequest(BaseModel):
     question: str = Field(
         min_length=2,
         max_length=500,
-        description="General question to synthesize into 16kHz speech and stream into the cascade.",
+        description="General question to synthesize into speech and stream into the cascade.",
     )
     turn_stop_mode: Literal["smart_turn", "vad"] | None = Field(
         default=None,
         description="Optional per-turn endpointing override.",
+    )
+    telephony_8k: bool | None = Field(
+        default=None,
+        description="When true, simulate an 8kHz telephony dialer (8kHz in -> 16kHz STT -> 24kHz TTS -> 8kHz out).",
+    )
+    dialer_encoding: Literal["ulaw", "alaw", "pcm16"] | None = Field(
+        default=None,
+        description="8kHz dialer codec to simulate when telephony_8k is enabled ('ulaw', 'alaw', or 'pcm16').",
     )
 
 
@@ -70,7 +88,7 @@ def rewrite_ws_url_for_request(ws_url: str, request: Request) -> str:
 
 
 def register_observatory_routes(target_app: FastAPI, store: LatencyStore) -> None:
-    """Attach the custom Latency Observatory UI and telemetry API routes to FastAPI."""
+    """Attach the custom Latency Observatory UI, 8kHz telephony endpoints, and telemetry routes."""
     if getattr(target_app.state, "cascade_routes_registered", False):
         return
     target_app.state.cascade_routes_registered = True
@@ -122,6 +140,83 @@ def register_observatory_routes(target_app: FastAPI, store: LatencyStore) -> Non
         cfg = load_config()
         return cfg.public_summary()
 
+    @target_app.get("/api/telephony")
+    async def get_telephony_info(request: Request) -> dict[str, object]:
+        cfg = load_config()
+        ws_base = rewrite_ws_url_for_request("ws://localhost:7860/ws", request)
+        ws_dialer = rewrite_ws_url_for_request("ws://localhost:7860/ws-dialer", request)
+        return {
+            "enabled": cfg.telephony_8k_enabled,
+            "dialer_sample_rate_hz": cfg.dialer_sample_rate,
+            "stt_pipeline_sample_rate_hz": cfg.audio_in_sample_rate,
+            "tts_native_sample_rate_hz": 24000,
+            "dialer_encoding": cfg.dialer_encoding,
+            "endpoints": {
+                "provider_auto_detect_ws": ws_base,
+                "universal_dialer_8k_ws": f"{ws_dialer}?codec={cfg.dialer_encoding}&rate={cfg.dialer_sample_rate}",
+                "twiml_webhook": str(request.base_url).rstrip("/") + "/twiml",
+            },
+            "supported_providers": ["twilio", "exotel", "plivo", "telnyx", "custom-8k-dialer"],
+            "supported_codecs": ["ulaw", "alaw", "pcm16"],
+        }
+
+    @target_app.api_route("/twiml", methods=["GET", "POST"], include_in_schema=False)
+    async def twiml_stream_webhook(request: Request) -> Response:
+        ws_url = rewrite_ws_url_for_request("ws://localhost:7860/ws", request)
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            "<Response>\n"
+            "  <Connect>\n"
+            f'    <Stream url="{ws_url}" />\n'
+            "  </Connect>\n"
+            "</Response>"
+        )
+        return Response(content=xml, media_type="application/xml")
+
+    @target_app.websocket("/ws-dialer")
+    async def websocket_dialer_8k_endpoint(
+        websocket: WebSocket,
+        codec: str = Query(default=""),
+        rate: int = Query(default=TELEPHONY_SAMPLE_RATE),
+        wire: Literal["auto", "json", "binary"] = Query(default="auto"),
+    ) -> None:
+        """Direct 8kHz telephony WebSocket endpoint for SIP/PBX/custom dialer bridges."""
+        cfg = load_config()
+        cfg.require_api_key()
+        await websocket.accept()
+
+        encoding = normalize_dialer_encoding(codec or cfg.dialer_encoding, default=cfg.dialer_encoding)
+        dialer_rate = rate if rate > 0 else cfg.dialer_sample_rate
+        tele_cfg = cfg.with_telephony_8k(
+            enabled=True,
+            encoding=encoding,
+            dialer_sample_rate=dialer_rate,
+        )
+        session_id = f"dialer-{uuid.uuid4().hex[:8]}"
+
+        serializer = Dialer8kFrameSerializer(
+            stream_sid=session_id,
+            call_sid=session_id,
+            params=Dialer8kFrameSerializer.InputParams(
+                dialer_sample_rate=dialer_rate,
+                sample_rate=tele_cfg.audio_in_sample_rate,
+                encoding=encoding,
+                wire_format=wire,
+            ),
+        )
+        ws_params = build_telephony_websocket_params(tele_cfg, serializer=serializer)
+        transport = FastAPIWebsocketTransport(websocket=websocket, params=ws_params)
+
+        worker, _monitor = create_cascade_session(
+            transport,
+            tele_cfg,
+            store=store,
+            session_id=session_id,
+            emit_rtvi_messages=False,
+            cancel_on_idle_timeout=True,
+        )
+        await run_cascade_worker(worker, handle_sigint=False)
+
     @target_app.get("/api/latency")
     async def get_latency_snapshot(
         session_id: str | None = Query(default=None),
@@ -151,30 +246,71 @@ def register_observatory_routes(target_app: FastAPI, store: LatencyStore) -> Non
             cfg = dataclasses.replace(cfg, turn_stop_mode=mode)
 
         try:
-            return await run_simulated_voice_turn(req.question.strip(), cfg, store=store)
+            return await run_simulated_voice_turn(
+                req.question.strip(),
+                cfg,
+                store=store,
+                telephony_8k=req.telephony_8k,
+                dialer_encoding=req.dialer_encoding,
+            )
         except Exception as exc:
             logger.exception("Simulated voice turn failed")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-async def bot(runner_args: RunnerArguments) -> None:
-    """Pipecat Runner entrypoint invoked for each incoming WebRTC / WebSocket session."""
-    cfg = load_config()
-    cfg.require_api_key()
+async def create_session_transport(
+    runner_args: RunnerArguments,
+    cfg: CascadeConfig,
+) -> tuple[BaseTransport, CascadeConfig, bool]:
+    """Build the appropriate transport and effective CascadeConfig for incoming runner_args.
+
+    Returns `(transport, effective_cfg, is_telephony)`.
+    """
+    if isinstance(runner_args, WebSocketRunnerArguments) and runner_args.transport_type != "websocket":
+        # Incoming telephony dialer connection on `/ws` (Twilio, Exotel, Plivo, Telnyx, or custom)
+        transport_type, call_data = await parse_telephony_websocket(runner_args.websocket)
+        runner_args.transport_type = transport_type
+        runner_args.call_data = call_data
+
+        tele_cfg = cfg.with_telephony_8k(enabled=True)
+        serializer = build_provider_serializer(
+            transport_type,
+            call_data,
+            default_encoding=tele_cfg.dialer_encoding,
+            dialer_sample_rate=tele_cfg.dialer_sample_rate,
+            pipeline_in_sample_rate=tele_cfg.audio_in_sample_rate,
+        )
+        ws_params = build_telephony_websocket_params(tele_cfg, serializer=serializer)
+        transport = FastAPIWebsocketTransport(websocket=runner_args.websocket, params=ws_params)
+        return transport, tele_cfg, True
 
     transport_factories = {
         "webrtc": lambda: build_transport_params(cfg),
         "websocket": lambda: build_websocket_params(cfg),
         "daily": lambda: build_transport_params(cfg),
+        "twilio": lambda: build_telephony_websocket_params(cfg.with_telephony_8k(enabled=True)),
+        "exotel": lambda: build_telephony_websocket_params(cfg.with_telephony_8k(enabled=True)),
+        "plivo": lambda: build_telephony_websocket_params(cfg.with_telephony_8k(enabled=True)),
+        "telnyx": lambda: build_telephony_websocket_params(cfg.with_telephony_8k(enabled=True)),
     }
     transport = await create_transport(runner_args, transport_factories)
+    return transport, cfg, False
+
+
+async def bot(runner_args: RunnerArguments) -> None:
+    """Pipecat Runner entrypoint invoked for each incoming WebRTC / WebSocket / Telephony session."""
+    cfg = load_config()
+    cfg.require_api_key()
+
+    transport, active_cfg, is_telephony = await create_session_transport(runner_args, cfg)
 
     session_id = getattr(runner_args, "session_id", None)
     worker, _monitor = create_cascade_session(
         transport,
-        cfg,
+        active_cfg,
         store=GLOBAL_LATENCY_STORE,
         session_id=session_id,
+        emit_rtvi_messages=not is_telephony,
         cancel_on_idle_timeout=True,
     )
     await run_cascade_worker(

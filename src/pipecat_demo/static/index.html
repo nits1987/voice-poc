@@ -727,13 +727,18 @@
     <!-- Architecture Strip -->
     <section class="arch-strip" aria-label="Cascade pipeline stages">
       <div class="arch-nodes">
+        <div class="arch-node" id="node-tele" style="--node-color: var(--c-out)">
+          <div class="arch-node-stage">Dialer · 8kHz Converter</div>
+          <div class="arch-node-model" id="model-tele">8kHz &harr; 16kHz / 24kHz (SOXR)</div>
+        </div>
+        <span class="arch-arrow">&rarr;</span>
         <div class="arch-node" id="node-vad" style="--node-color: var(--c-vad)">
           <div class="arch-node-stage">0 · Local VAD</div>
           <div class="arch-node-model" id="model-vad">Silero VAD (0.20s)</div>
         </div>
         <span class="arch-arrow">&rarr;</span>
         <div class="arch-node" id="node-stt" style="--node-color: var(--c-stt)">
-          <div class="arch-node-stage">1 · Live STT (WS)</div>
+          <div class="arch-node-stage">1 · Live STT (16kHz)</div>
           <div class="arch-node-model" id="model-stt">gemini-3.5-transcribe-live</div>
         </div>
         <span class="arch-arrow">&rarr;</span>
@@ -748,7 +753,7 @@
         </div>
         <span class="arch-arrow">&rarr;</span>
         <div class="arch-node" id="node-tts" style="--node-color: var(--c-tts)">
-          <div class="arch-node-stage">4 · Streaming TTS</div>
+          <div class="arch-node-stage">4 · Streaming TTS (24kHz&rarr;8kHz)</div>
           <div class="arch-node-model" id="model-tts">gemini-3.8-flash-lite-tts</div>
         </div>
       </div>
@@ -812,11 +817,12 @@
           <div>
             <h2 class="panel-title">Live RTVI Voice Session</h2>
             <p class="panel-subtitle" id="voice-transport-subtitle">
-              16kHz PCM mic &rarr; <code>/ws-client</code> Protobuf RTVI &rarr; 24kHz AudioWorklet (Cloudtop &amp; SSH Tunnel Ready)
+              8kHz Dialer Mic &rarr; <code>Telephony8kInputConverter</code> (16kHz) &rarr; TTS (24kHz&rarr;8kHz)
             </p>
           </div>
           <select id="transport-select" class="transport-select" aria-label="Voice transport">
-            <option value="websocket" selected>WebSocket RTVI (Cloudtop / Tunnel)</option>
+            <option value="websocket-8k" selected>WebSocket 8kHz Telephony Sim (8kHz &rarr; 16kHz)</option>
+            <option value="websocket">WebSocket Wideband (16kHz in / 24kHz out)</option>
             <option value="webrtc">SmallWebRTC (Direct UDP / Localhost)</option>
           </select>
         </div>
@@ -832,11 +838,17 @@
       <section class="panel">
         <div class="panel-header">
           <div>
-            <h2 class="panel-title">Spoken Turn Simulator (No Mic Needed)</h2>
+            <h2 class="panel-title">Spoken Turn Simulator (8kHz Telephony &amp; 16kHz Wideband)</h2>
             <p class="panel-subtitle">
-              Synthesizes real 16kHz speech &amp; streams 20ms frames through VAD &rarr; STT &rarr; LLM &rarr; TTS
+              Synthesizes caller speech, passes through 8kHz dialer converter &rarr; 16kHz STT &rarr; LLM &rarr; 24kHz TTS &rarr; 8kHz out
             </p>
           </div>
+          <select id="sim-mode-select" class="transport-select" aria-label="Simulator audio mode">
+            <option value="8k-ulaw" selected>8kHz Dialer · G.711 &mu;-law (Twilio/Plivo)</option>
+            <option value="8k-alaw">8kHz Dialer · G.711 A-law (Telnyx/ISDN)</option>
+            <option value="8k-pcm16">8kHz Dialer · Linear PCM16 (Exotel/SIP)</option>
+            <option value="wideband">Wideband (16kHz In / 24kHz Out)</option>
+          </select>
         </div>
         <form class="sim-form" id="sim-form">
           <input
@@ -856,8 +868,8 @@
           <button type="button" class="chip" data-q="Why is the sky blue during the day and red at sunset?">Blue sky &amp; sunset</button>
         </div>
         <div class="audio-preview-wrap" id="sim-audio-wrap" hidden>
-          <div style="font-size: 0.74rem; color: var(--text-muted); margin-block: 0.5rem 0.25rem;">
-            Latest simulated bot response (24kHz Gemini 3.8 Flash-Lite TTS):
+          <div id="sim-audio-label" style="font-size: 0.74rem; color: var(--text-muted); margin-block: 0.5rem 0.25rem;">
+            Latest simulated bot response (8kHz Telephony Output):
           </div>
           <audio id="sim-audio" controls></audio>
         </div>
@@ -949,9 +961,11 @@
       btnExport: document.getElementById("btn-export"),
       botAudio: document.getElementById("bot-audio"),
       simForm: document.getElementById("sim-form"),
+      simModeSelect: document.getElementById("sim-mode-select"),
       simInput: document.getElementById("sim-input"),
       btnSim: document.getElementById("btn-sim"),
       simAudioWrap: document.getElementById("sim-audio-wrap"),
+      simAudioLabel: document.getElementById("sim-audio-label"),
       simAudio: document.getElementById("sim-audio"),
       transcriptList: document.getElementById("transcript-list"),
       transcriptEmpty: document.getElementById("transcript-empty"),
@@ -1007,7 +1021,7 @@
     }
 
     function clearAllStageHighlights() {
-      for (const id of ["node-vad", "node-stt", "node-turn", "node-llm", "node-tts"]) {
+      for (const id of ["node-tele", "node-vad", "node-stt", "node-turn", "node-llm", "node-tts"]) {
         highlightNode(id, false);
       }
     }
@@ -1239,6 +1253,12 @@
         if (cfgRes.ok) {
           const cfg = await cfgRes.json();
           state.config = cfg;
+          if (cfg.telephony) {
+            const teleEl = document.getElementById("model-tele");
+            if (teleEl) {
+              teleEl.textContent = `${Math.round(cfg.telephony.dialer_sample_rate_hz / 1000)}kHz (${String(cfg.telephony.dialer_encoding).toUpperCase()}) ↔ 16k/24k`;
+            }
+          }
           document.getElementById("model-vad").textContent =
             `Silero VAD (${Number(cfg.turn_detection.vad_stop_secs).toFixed(2)}s)`;
           document.getElementById("model-stt").textContent =
@@ -1448,7 +1468,7 @@
         constructor() {
           super();
           this.targetRate = 16000;
-          this.chunkSamples = 320; // 20ms @ 16kHz
+          this.chunkSamples = 320; // 20ms @ 16kHz (or 160 @ 8kHz)
           this.pcmBuf = new Int16Array(this.chunkSamples);
           this.pcmIdx = 0;
           this.phase = 0;
@@ -1456,8 +1476,17 @@
           this.accCount = 0;
           this.muted = false;
           this.port.onmessage = (ev) => {
-            if (ev.data && ev.data.type === "mute") {
+            if (!ev.data) return;
+            if (ev.data.type === "mute") {
               this.muted = Boolean(ev.data.muted);
+            } else if (ev.data.type === "setRate" && Number(ev.data.targetRate) > 0) {
+              this.targetRate = Number(ev.data.targetRate);
+              this.chunkSamples = Math.round((this.targetRate * 20) / 1000);
+              this.pcmBuf = new Int16Array(this.chunkSamples);
+              this.pcmIdx = 0;
+              this.phase = 0;
+              this.accSum = 0;
+              this.accCount = 0;
             }
           };
         }
@@ -1746,10 +1775,17 @@
         };
         state.wsSession = session;
 
+        const is8kSim = els.transportSelect.value === "websocket-8k";
+        const captureRate = is8kSim ? 8000 : 16000;
+        captureNode.port.postMessage({ type: "setRate", targetRate: captureRate });
+        if (is8kSim) {
+          highlightNode("node-tele", true);
+        }
+
         captureNode.port.onmessage = (ev) => {
           if (!state.micEnabled || ws.readyState !== WebSocket.OPEN) return;
           const pcmBytes = new Uint8Array(ev.data);
-          ws.send(encodePipecatAudioFrame(pcmBytes, 16000, 1));
+          ws.send(encodePipecatAudioFrame(pcmBytes, captureRate, 1));
         };
 
         ws.addEventListener("open", () => {
@@ -2045,6 +2081,9 @@
       if (els.transportSelect.value === "webrtc") {
         els.voiceSubtitle.innerHTML =
           `Pipecat RTVI JS Client (SmallWebRTC direct UDP · requires local host or UDP network reachability)`;
+      } else if (els.transportSelect.value === "websocket-8k") {
+        els.voiceSubtitle.innerHTML =
+          `8kHz Dialer Mic &rarr; <code>Telephony8kInputConverter</code> (16kHz) &rarr; TTS (24kHz&rarr;8kHz)`;
       } else {
         els.voiceSubtitle.innerHTML =
           `16kHz PCM mic &rarr; <code>/ws-client</code> Protobuf RTVI &rarr; 24kHz AudioWorklet (Cloudtop &amp; SSH Tunnel Ready)`;
@@ -2075,9 +2114,14 @@
       const question = els.simInput.value.trim();
       if (!question) return;
 
+      const simMode = els.simModeSelect ? els.simModeSelect.value : "8k-ulaw";
+      const telephony8k = simMode !== "wideband";
+      const dialerEncoding = simMode.startsWith("8k-") ? simMode.slice(3) : "ulaw";
+
       els.btnSim.disabled = true;
       const prevLabel = els.btnSim.textContent;
       els.btnSim.textContent = "Streaming…";
+      if (telephony8k) highlightNode("node-tele", true);
       highlightNode("node-stt", true);
       highlightNode("node-llm", true);
       highlightNode("node-tts", true);
@@ -2086,7 +2130,11 @@
         const res = await fetch("/api/simulate-turn", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ question }),
+          body: JSON.stringify({
+            question,
+            telephony_8k: telephony8k,
+            dialer_encoding: dialerEncoding,
+          }),
         });
         const body = await res.json();
         if (!res.ok) {
@@ -2100,6 +2148,11 @@
 
         if (body.bot_audio_wav_base64) {
           els.simAudioWrap.hidden = false;
+          if (els.simAudioLabel) {
+            els.simAudioLabel.textContent = body.telephony_8k
+              ? `Latest simulated bot response (${body.user_sample_rate_hz || 8000}Hz ${String(body.dialer_encoding || "ulaw").toUpperCase()} in → 16000Hz STT → 24000Hz TTS → ${body.bot_sample_rate_hz || 8000}Hz Dialer WAV):`
+              : `Latest simulated bot response (16000Hz in → 24000Hz Wideband WAV):`;
+          }
           els.simAudio.src = `data:audio/wav;base64,${body.bot_audio_wav_base64}`;
           els.simAudio.play().catch(() => {});
         }
@@ -2109,6 +2162,7 @@
       } finally {
         els.btnSim.disabled = false;
         els.btnSim.textContent = prevLabel;
+        highlightNode("node-tele", false);
         highlightNode("node-stt", false);
         highlightNode("node-llm", false);
         highlightNode("node-tts", false);

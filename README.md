@@ -1,54 +1,52 @@
-# Pipecat Gemini STT → LLM → TTS Cascade Voice Bot & Latency Observatory
+# Pipecat Gemini STT → LLM → TTS Cascade Voice Bot (with 8kHz Telephony Dialer Converter)
 
-A real-time streaming cascade voice bot built on **Pipecat (`pipecat-ai >= 1.13`)** and **Pipecat Client JS (`@pipecat-ai/client-js`)** to evaluate end-to-end voice latency as well as per-block latency across three Gemini models:
+A real-time streaming cascade voice bot built on **Pipecat (`pipecat-ai >= 1.13`)** and **Pipecat Client JS (`@pipecat-ai/client-js`)** to evaluate end-to-end voice latency and per-block latency across three Gemini models, with built-in **8kHz Telephony Dialer Conversion** (`teledemo` branch):
 
-1. **STT Block (`GeminiSTTService`)**: `gemini-3.5-transcribe-live` over Gemini Live API WebSockets (16kHz PCM in) paired with local **Silero VAD** Hybrid endpointing (`audio_stream_end=True`).
-2. **LLM Block (`GoogleLLMService`)**: `gemini-3.5-flash-lite` with `thinking_level="minimal"` for low-latency token streaming.
-3. **TTS Block (`GeminiTTSService`)**: `gemini-3.8-flash-lite-tts` via the `google-genai` Developer API (`use_genai=True`, 24kHz mono PCM out).
+1. **8kHz Telephony Input Converter (`Telephony8kInputConverter`)**: Accepts **8,000 Hz** telephone audio (`G.711 μ-law`, `G.711 A-law`, or `16-bit Linear PCM`) from PSTN/SIP/Cloud dialers and upsamples it in real time via `SOXRStreamAudioResampler` to **16,000 Hz PCM16LE**.
+2. **STT Block (`GeminiSTTService`)**: `gemini-3.5-transcribe-live` over Gemini Live API WebSockets (**16kHz PCM** in) paired with local **Silero VAD** Hybrid endpointing (`audio_stream_end=True`) and **SmartTurn v3 ONNX**.
+3. **LLM Block (`GoogleLLMService`)**: `gemini-3.5-flash-lite` with `thinking_level="minimal"` for low-latency token streaming.
+4. **TTS Block (`GeminiTTSService`)**: `gemini-3.8-flash-lite-tts` via the `google-genai` Developer API (`use_genai=True`, **24kHz mono PCM** native output).
+5. **8kHz Telephony Output Converter (`Telephony8kOutputConverter`)**: Downsamples **24,000 Hz** Gemini TTS audio frames to **8,000 Hz** (flushing the SOXR filter tail on `TTSStoppedFrame`) and encodes to `G.711 μ-law`, `G.711 A-law`, or `8kHz PCM16LE` for the dialer output transport.
 
 ---
 
-## Architecture & Latency Instrumentation
+## Architecture & Sample-Rate Conversion Flow (`teledemo`)
 
 ```text
-Mic / 16kHz PCM ─▶ [InputTransport] ─▶ [GeminiSTTService: gemini-3.5-transcribe-live]
-                                                │  ▲
-                            16kHz audio + text  │  │ VADUserStoppedSpeakingFrame (audio_stream_end)
-                                                ▼  │
-                                       [LLMUserAggregator] (Silero VAD + SmartTurn v3 ONNX)
-                                                │
-                                                ▼
-                                       [GoogleLLMService: gemini-3.5-flash-lite]
-                                                │
-                                                ▼ (token stream -> sentence aggregator)
-                                       [GeminiTTSService: gemini-3.8-flash-lite-tts]
-                                                │
-                                                ▼ (24kHz audio chunks)
-                     Speaker / RTVI ◀─ [OutputTransport] ─▶ [LLMAssistantAggregator]
+8kHz Dialer (Twilio / Exotel / Plivo / Telnyx / SIP /ws-dialer: μ-law, A-law, or PCM16)
+        │
+        ▼ (8,000 Hz)
+[InputTransport / DialerSerializer] ──▶ [Telephony8kInputConverter: 8kHz -> 16kHz SOXR]
+                                                        │
+                                                        ▼ (16,000 Hz PCM16LE)
+                                        [GeminiSTTService: gemini-3.5-transcribe-live]
+                                                        │  ▲
+                                    16kHz audio + text  │  │ VADUserStoppedSpeakingFrame
+                                                        ▼  │
+                                        [LLMUserAggregator] (Silero VAD + SmartTurn v3 ONNX @ 16kHz)
+                                                        │
+                                                        ▼
+                                        [GoogleLLMService: gemini-3.5-flash-lite]
+                                                        │
+                                                        ▼ (token stream -> sentence aggregator)
+                                        [GeminiTTSService: gemini-3.8-flash-lite-tts (24,000 Hz)]
+                                                        │
+                                                        ▼ (24kHz -> 8kHz SOXR + tail flush)
+                                        [Telephony8kOutputConverter: 24kHz -> 8kHz]
+                                                        │
+                                                        ▼ (8,000 Hz PCM16 / μ-law / A-law)
+8kHz Dialer / Speaker / RTVI ◀───────── [OutputTransport] ──▶ [LLMAssistantAggregator]
 ```
 
-### What Gets Measured on Every Turn
-`CascadeLatencyMonitor` combines Pipecat's `UserBotLatencyObserver` (critical-path timeline from the exact instant the user stops speaking to the instant `BotStartedSpeakingFrame` leaves the output transport) with per-service `MetricsFrame` telemetry:
+### Supported 8kHz Telephony Dialers & Endpoints
 
-| Metric | Critical-Path Waterfall Key | Per-Service Metric | Definition |
+| Dialer / Protocol | WebSocket Endpoint | Wire Format & Codec | Notes |
 | :--- | :--- | :--- | :--- |
-| **Overall E2E Perceived** | Sum of all stages | `e2e_from_user_silence_ms` | Actual end of user speech (`VAD stop - vad_stop_secs`) to first bot audio frame leaving output transport |
-| **Net Cascade (ex-VAD)** | E2E minus `endpointing_wait` | `e2e_from_vad_stop_ms` | Latency strictly after Silero VAD confirms silence |
-| **0. VAD Endpointing Wait** | `endpointing_wait` | `vad_stop_secs` | Silence window required by Silero VAD (`0.20s` default) |
-| **1. Live STT** | `transcription` (`stt_finalize_ms`) | `stt_ttfb_ms`, `stt_utterance_processing_ms` | Time after user silence until `gemini-3.5-transcribe-live` emits finalized `TranscriptionFrame` |
-| **2. Turn Detection** | `turn_detection` | `smart_turn_e2e_ms`, `smart_turn_probability` | Local SmartTurn v3 ONNX end-of-turn classification time after transcript arrives |
-| **3. LLM Inference** | `llm_inference` | `llm_ttfb_ms`, `llm_ttfat_ms`, `llm_total_processing_ms` | `gemini-3.5-flash-lite` time-to-first-token, time-to-first-actionable-text, and full stream duration |
-| **4. Sentence Aggregation** | `sentence_aggregation` | `sentence_aggregation_ms` | Time buffering streamed LLM tokens until the first speakable sentence boundary |
-| **5. TTS Synthesis** | `speech_synthesis` | `tts_ttfb_ms`, `tts_ttfa_ms`, `tts_total_processing_ms` | `gemini-3.8-flash-lite-tts` time-to-first-byte, time-to-first-audible-audio, and full stream synthesis |
-| **6. Output & Pipeline** | `output_transport`, `pipeline` | `output_transport_ms`, `pipeline_overhead_ms` | Transport audio buffer framing + async frame-queue handoff overhead |
-
-All completed turns are persisted to `logs/latency_metrics.jsonl` (with initial greetings isolated from `user_turn` P50/P95/Mean aggregates).
-
-### Observed Benchmark Result: `< 1s` End-to-End Bot Speech Start
-In live interactive voice sessions, **overall end-to-end latency from user silence to bot speech start (`e2e_from_user_silence_ms`) consistently lands under 1 second (`< 1,000 ms`)**. Three streaming design choices keep the cascade sub-second:
-- **Continuous Live STT WebSocket**: Audio streams in 20ms 16kHz frames to `gemini-3.5-transcribe-live` *while* the user is speaking, so once local Silero VAD (`0.20s`) + SmartTurn v3 ONNX detect turn completion, finalized transcription arrives almost immediately.
-- **Minimal-Thinking Token Streaming**: `gemini-3.5-flash-lite` runs with `thinking_level="minimal"` and streams tokens into the sentence aggregator as soon as the first clause forms—without waiting for full LLM completion.
-- **Streaming Audio Chunks**: `gemini-3.8-flash-lite-tts` synthesizes and emits 24kHz PCM audio chunks incrementally, starting playback as soon as the first audio chunk arrives.
+| **Twilio Media Streams** | `ws://<host>:7860/ws` (TwiML: `POST /twiml`) | JSON base64 · `8kHz G.711 μ-law (PCMU)` | Auto-detected by `parse_telephony_websocket` |
+| **Exotel Voicebot Applet** | `ws://<host>:7860/ws` | JSON base64 · `8kHz 16-bit Linear PCM` | Auto-detected by `parse_telephony_websocket` |
+| **Plivo AudioStream** | `ws://<host>:7860/ws` | JSON base64 · `8kHz G.711 μ-law (PCMU)` | Auto-detected by `parse_telephony_websocket` |
+| **Telnyx Media Streaming** | `ws://<host>:7860/ws` | JSON base64 · `8kHz PCMU / PCMA` | Auto-detected by `parse_telephony_websocket` |
+| **Universal 8kHz Dialer** | `ws://<host>:7860/ws-dialer?codec=ulaw&rate=8000` | JSON base64 **or** Raw Binary (`ulaw`, `alaw`, `pcm16`) | Works with Asterisk AudioSocket, FreeSWITCH, Ozonetel, Genesys, custom PBXs |
 
 ---
 
@@ -59,6 +57,9 @@ Create or edit `.env` in the repository root and add your Gemini Developer API k
 
 ```ini
 GOOGLE_API_KEY=AIza...
+TELEPHONY_8K_ENABLED=true
+DIALER_SAMPLE_RATE=8000
+DIALER_ENCODING=ulaw
 ```
 
 ### 2. Start the Server
@@ -67,39 +68,22 @@ uv run bot.py
 ```
 *(Binds to `0.0.0.0:7860` by default; pass `--port <PORT>` or `--host <HOST>` to override.)*
 
-### 3. Test the Voice Flow (`/client/`) & Inspect Metrics (`/dashboard`)
-Use the two web routes side-by-side when testing:
+### 3. Test 8kHz Telephony Mode in the Dashboard (`/dashboard`)
+Open `http://localhost:7860/dashboard`:
+1. **Live 8kHz Mic Simulation**: Select **`WebSocket 8kHz Telephony Sim (8kHz → 16kHz)`** in the transport dropdown and click **Connect & Talk** to stream 8kHz mic frames through `Telephony8kInputConverter`.
+2. **No-Mic 8kHz Dialer Simulator**: Select **`8kHz Dialer · G.711 μ-law`**, **`G.711 A-law`**, or **`Linear PCM16`** in the Spoken Turn Simulator and click **Run Turn** to synthesize an 8kHz telephone caller turn and play back the 8kHz converted bot response WAV.
 
-1. **Test the Live Voice Flow — `/client/` (`http://localhost:7860/client/`)**:
-   - Opens the **Pipecat Prebuilt Client UI** to run and test live multi-turn voice conversations with the bot (microphone input, live transcripts, audio playback, and transport selection—use **WebSocket** when over an SSH tunnel/Cloudtop, or **WebRTC** on direct localhost).
-2. **Check Latency Metrics & Waterfalls — `/dashboard` (`http://localhost:7860/dashboard`)**:
-   - Opens the **Latency Observatory Dashboard** to inspect **P50 / P95 KPI cards**, **per-turn critical-path waterfalls**, and **per-block STT / LLM / TTS latency breakdowns** (`TTFB`, `TTFAT`, `TTFA`, token counts, and JSON export).
-   - Every turn spoken in `/client/` is recorded by `CascadeLatencyMonitor` into the shared `GLOBAL_LATENCY_STORE` and automatically appears on `/dashboard` in real time (you can also test directly from `/dashboard` via **Connect & Talk** or the no-mic **Spoken Turn Simulator**).
-
-> **Cloudtop / Remote Host Tip**: Browser microphone capture (`navigator.mediaDevices.getUserMedia`) requires HTTPS or `localhost`. When running the server on a remote dev box / Cloudtop:
-> ```bash
-> ssh -N -L 7860:localhost:7860 <your-cloudtop-host>
-> ```
-> Then open `http://localhost:7860/client/` to talk to the bot and `http://localhost:7860/dashboard` to monitor per-turn and aggregate latency metrics (or allowlist `http://<your-cloudtop-host>:7860` under `chrome://flags/#unsafely-treat-insecure-origin-as-secure`).
-
-### 4. Run the Headless Spoken Audio Benchmark CLI
-Synthesizes real 16kHz spoken questions, streams them in real-time 20ms frames through the full cascade (`Silero VAD -> Live STT -> SmartTurn v3 -> Flash-Lite LLM -> Flash-Lite TTS`), and prints per-turn waterfalls plus a P50/P95/Mean summary table:
-
+### 4. Run the Headless 8kHz Telephony Benchmark CLI
 ```bash
-uv run benchmark_cascade.py --turns 3 --save-wav-dir logs/wavs
+uv run benchmark_cascade.py --telephony-8k --dialer-encoding ulaw --turns 3 --save-wav-dir logs/wavs
 ```
 
-Run custom spoken questions or compare SmartTurn v3 vs pure VAD silence endpointing:
-
+Or compare against wideband (`16kHz in / 24kHz out`):
 ```bash
-uv run benchmark_cascade.py \
-  -q "How do geostationary satellites stay above the same spot on Earth?" \
-  -q "Why do leaves change color in autumn?" \
-  --turn-stop-mode vad \
-  --vad-stop-secs 0.2
+uv run benchmark_cascade.py --wideband --turns 3
 ```
 
-### 5. Run Unit & Route Verification Tests
+### 5. Run Unit & Telephony Converter Tests
 ```bash
 uv run python -m unittest discover -s tests -v
 ```

@@ -16,6 +16,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.serializers.protobuf import ProtobufFrameSerializer
 from pipecat.services.google.gemini_live.stt import GeminiSTTService
 from pipecat.services.google.llm import GoogleLLMService
@@ -29,6 +30,13 @@ from pipecat.workers.runner import WorkerRunner
 
 from pipecat_demo.config import CascadeConfig
 from pipecat_demo.latency import CascadeLatencyMonitor, LatencyStore
+from pipecat_demo.telephony import (
+    STT_PIPELINE_SAMPLE_RATE,
+    TTS_NATIVE_SAMPLE_RATE,
+    Dialer8kFrameSerializer,
+    Telephony8kInputConverter,
+    Telephony8kOutputConverter,
+)
 
 GREETING_PROMPT = (
     "Greet the user warmly in one short sentence and invite them to ask any general question."
@@ -36,7 +44,7 @@ GREETING_PROMPT = (
 
 
 def build_transport_params(cfg: CascadeConfig) -> TransportParams:
-    """Build audio-only TransportParams matching the Gemini STT (16kHz) and TTS (24kHz) rates."""
+    """Build audio-only TransportParams matching the configured input and output sample rates."""
     return TransportParams(
         audio_in_enabled=True,
         audio_in_sample_rate=cfg.audio_in_sample_rate,
@@ -54,6 +62,29 @@ def build_websocket_params(cfg: CascadeConfig) -> FastAPIWebsocketParams:
         audio_out_sample_rate=cfg.audio_out_sample_rate,
         add_wav_header=False,
         serializer=ProtobufFrameSerializer(),
+    )
+
+
+def build_telephony_websocket_params(
+    cfg: CascadeConfig,
+    *,
+    serializer: FrameSerializer | None = None,
+) -> FastAPIWebsocketParams:
+    """Build 8kHz telephony WebSocket transport params (`twilio`, `exotel`, `plivo`, `telnyx`, `dialer`)."""
+    active_serializer = serializer or Dialer8kFrameSerializer(
+        params=Dialer8kFrameSerializer.InputParams(
+            dialer_sample_rate=cfg.dialer_sample_rate,
+            sample_rate=cfg.audio_in_sample_rate,
+            encoding=cfg.dialer_encoding,
+        )
+    )
+    return FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_in_sample_rate=cfg.audio_in_sample_rate,
+        audio_out_enabled=True,
+        audio_out_sample_rate=cfg.dialer_sample_rate,
+        add_wav_header=False,
+        serializer=active_serializer,
     )
 
 
@@ -81,9 +112,10 @@ def create_cascade_services(
     """Instantiate the three Gemini cascade blocks without deprecated parameters."""
     api_key = cfg.require_api_key()
 
-    # Block 1: Streaming Live Transcription over WebSocket with Hybrid Silero VAD finalization
+    # Block 1: Streaming Live Transcription over WebSocket (16kHz PCM input)
     stt = GeminiSTTService(
         api_key=api_key,
+        sample_rate=STT_PIPELINE_SAMPLE_RATE,
         settings=GeminiSTTService.Settings(
             model=cfg.stt_model,
             mode=cfg.stt_mode,
@@ -100,10 +132,11 @@ def create_cascade_services(
         ),
     )
 
-    # Block 3: Streaming speech synthesis via Gemini Developer API (24kHz mono PCM)
+    # Block 3: Streaming speech synthesis via Gemini Developer API (pinned at 24kHz native)
     tts = GeminiTTSService(
         api_key=api_key,
         use_genai=True,
+        sample_rate=TTS_NATIVE_SAMPLE_RATE,
         settings=GeminiTTSService.Settings(
             model=cfg.tts_model,
             voice=cfg.tts_voice,
@@ -137,13 +170,24 @@ def create_cascade_session(
         user_params=build_user_aggregator_params(cfg),
     )
 
+    # 8kHz <-> 16kHz/24kHz telephony audio converters:
+    # - Input converter upsamples any 8kHz InputAudioRawFrame to 16kHz before STT & VAD.
+    # - Output converter downsamples 24kHz Gemini TTS frames to 8kHz when output is 8kHz.
+    input_converter = Telephony8kInputConverter(target_sample_rate=cfg.audio_in_sample_rate)
+    output_converter = Telephony8kOutputConverter(
+        enabled=(cfg.audio_out_sample_rate != TTS_NATIVE_SAMPLE_RATE),
+        target_sample_rate=cfg.audio_out_sample_rate,
+    )
+
     pipeline = Pipeline(
         [
             transport.input(),
+            input_converter,
             stt,
             user_aggregator,
             llm,
             tts,
+            output_converter,
             transport.output(),
             assistant_aggregator,
         ]
@@ -199,7 +243,9 @@ def create_cascade_session(
         nonlocal greeting_fallback_task
         logger.info(
             f"[{resolved_session_id}] Client connected "
-            f"(STT={cfg.stt_model} -> LLM={cfg.llm_model} -> TTS={cfg.tts_model})"
+            f"(STT={cfg.stt_model}@{cfg.audio_in_sample_rate}Hz -> "
+            f"LLM={cfg.llm_model} -> "
+            f"TTS={cfg.tts_model}@24000Hz->{cfg.audio_out_sample_rate}Hz)"
         )
         if should_greet and not greeted:
             if worker.rtvi is None:
@@ -218,7 +264,12 @@ def create_cascade_session(
         disconnected = True
         if greeting_fallback_task is not None and not greeting_fallback_task.done():
             greeting_fallback_task.cancel()
-        logger.info(f"[{resolved_session_id}] Client disconnected; flushing latency metrics.")
+        logger.info(
+            f"[{resolved_session_id}] Client disconnected "
+            f"(in_converted={input_converter.telemetry.frames_converted}, "
+            f"out_converted={output_converter.telemetry.frames_converted}); "
+            "flushing latency metrics."
+        )
         await monitor.flush_open_turn()
         await worker.cancel()
 
