@@ -71,13 +71,21 @@ class SimulateTurnRequest(BaseModel):
 def rewrite_ws_url_for_request(ws_url: str, request: Request) -> str:
     """Rewrite Pipecat Runner's `wsUrl` to match the caller's actual scheme and Host header."""
     parsed = urlsplit(ws_url)
+    origin_raw = request.headers.get("origin", "").strip()
+    referer_raw = request.headers.get("referer", "").strip()
+    origin_split = urlsplit(origin_raw) if origin_raw else None
+    referer_split = urlsplit(referer_raw) if referer_raw else None
+
     forwarded_proto = (
         request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        or (origin_split.scheme.lower() if origin_split and origin_split.scheme else "")
+        or (referer_split.scheme.lower() if referer_split and referer_split.scheme else "")
         or request.url.scheme.lower()
     )
     ws_scheme = "wss" if forwarded_proto in ("https", "wss") else "ws"
     forwarded_host = (
         request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+        or (origin_split.netloc if origin_split and origin_split.netloc else "")
         or request.headers.get("host", "").strip()
         or request.url.netloc
         or parsed.netloc

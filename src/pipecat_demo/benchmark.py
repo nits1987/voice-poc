@@ -551,6 +551,8 @@ def run() -> None:
     parser.add_argument(
         "-n",
         "--turns",
+        "--runs",
+        dest="turns",
         type=int,
         default=2,
         help="Number of default general-knowledge questions to run when --question is omitted (default: 2).",

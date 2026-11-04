@@ -17,6 +17,7 @@ dependencies = [
 [project.scripts]
 pipecat-demo = "pipecat_demo.server:run"
 pipecat-benchmark = "pipecat_demo.benchmark:run"
+pipecat-cascade-benchmark = "pipecat_demo.benchmark:run"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

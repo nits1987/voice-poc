@@ -496,6 +496,21 @@ class CascadeLatencyTest(unittest.IsolatedAsyncioTestCase):
                 "wss://voice-demo.example.com/ws-client",
             )
 
+            # 3) HTTPS Origin header without X-Forwarded-Proto -> upgraded to wss://
+            res_origin = client.post(
+                "/start",
+                json={"transport": "websocket"},
+                headers={
+                    "Host": "127.0.0.1:7860",
+                    "Origin": "https://7860-nd-dev01.proxy.googlers.com",
+                },
+            )
+            self.assertEqual(res_origin.status_code, 200)
+            self.assertEqual(
+                res_origin.json()["wsUrl"],
+                "wss://7860-nd-dev01.proxy.googlers.com/ws-client",
+            )
+
     async def test_websocket_params_and_browser_protobuf_wire_compatibility(self) -> None:
         import json
 

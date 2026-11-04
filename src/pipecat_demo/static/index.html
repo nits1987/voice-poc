@@ -1753,8 +1753,20 @@
           throw new Error(errBody?.detail || `POST /start failed (HTTP ${startResp.status})`);
         }
         const startData = await startResp.json();
-        const fallbackProto = window.location.protocol === "https:" ? "wss:" : "ws:";
-        let wsUrl = startData.wsUrl || `${fallbackProto}//${window.location.host}/ws-client`;
+        const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+        let wsUrl = startData.wsUrl || `${wsProto}//${window.location.host}/ws-client`;
+        try {
+          const parsedWs = new URL(wsUrl, window.location.href);
+          parsedWs.protocol = wsProto;
+          if (window.location.host) {
+            parsedWs.host = window.location.host;
+          }
+          wsUrl = parsedWs.toString();
+        } catch (_) {
+          if (window.location.protocol === "https:" && wsUrl.startsWith("ws://")) {
+            wsUrl = "wss://" + wsUrl.slice(5);
+          }
+        }
         if (startData.token && !wsUrl.includes("token=")) {
           wsUrl += `${wsUrl.includes("?") ? "&" : "?"}token=${encodeURIComponent(startData.token)}`;
         }
